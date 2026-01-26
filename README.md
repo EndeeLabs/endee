@@ -231,3 +231,38 @@ We welcome contributions from the community to help make vector search faster an
 * **Feature Requests**: If there is a specific functionality you need, start a discussion in the issues section.
 
 ---
+
+## License
+
+Endee is open source software licensed under the
+**Apache License 2.0**.
+
+You are free to use, modify, and distribute this software for
+personal, commercial, and production use.
+
+See the LICENSE.txt file for full license terms.
+
+---
+
+## Trademark and Branding
+
+“Endee” and the Endee logo are trademarks of Endee Labs.
+
+The Apache License 2.0 does **not** grant permission to use the Endee name,
+logos, or branding in a way that suggests endorsement or affiliation.
+
+If you offer a hosted or managed service based on this software, you must:
+- Use your own branding
+- Avoid implying it is an official Endee service
+
+For trademark or branding permissions, contact: enterprise@endee.io
+
+---
+
+## Third-Party Software
+
+This project includes or depends on third-party software components that are
+licensed under their respective open source licenses.
+
+Use of those components is governed by the terms and conditions of their
+individual licenses, not by the Apache License 2.0 for this project.
