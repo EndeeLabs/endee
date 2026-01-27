@@ -89,25 +89,34 @@ public:
         }
         LOG_DEBUG("=== create_ids_batch START ===");
         LOG_DEBUG("Processing " << str_ids.size() << " string IDs");
-        // for (size_t i = 0; i < str_ids.size(); i++) {
-        //     LOG_DEBUG("Input[" << i << "]: [" << str_ids[i] << "] length=" <<
-        //     str_ids[i].length());
-        // }
 
         LOG_TIME("create_ids_batch");
         constexpr idInt INVALID_LABEL = static_cast<idInt>(-1);
-        // Tuple: <str_id, numeric_id, is_new_to_db, is_reused>
-        std::vector<std::tuple<std::string, idInt, bool, bool>> id_tuples;
 
-        id_tuples.reserve(str_ids.size());
-        for(const auto& str_id : str_ids) {
-            // true means that the ID is new and false means that the ID already exists
-            // is_reused defaults to false
-            id_tuples.emplace_back(str_id, INVALID_LABEL, true, false);
+        // === Deduplicate input while preserving first-seen order ===
+        std::unordered_map<std::string, size_t>
+                unique_index;  // maps string -> index in unique_keys
+        std::vector<std::string> unique_keys;
+        unique_keys.reserve(str_ids.size());
+
+        for(const auto& s : str_ids) {
+            auto it = unique_index.find(s);
+            if(it == unique_index.end()) {
+                unique_index.emplace(s, unique_keys.size());
+                unique_keys.push_back(s);
+            }
         }
 
-        //Read-only LMDB check
-        LOG_DEBUG("--- STEP 2: LMDB database check ---");
+        // id_tuples now correspond to unique_keys (not original str_ids)
+        std::vector<std::tuple<std::string, idInt, bool, bool>> id_tuples;
+        id_tuples.reserve(unique_keys.size());
+        for(const auto& s : unique_keys) {
+            // true means that the ID is new and false means that the ID already exists
+            // is_reused defaults to false
+            id_tuples.emplace_back(s, INVALID_LABEL, true, false);
+        }
+
+        // === STEP 2: LMDB database check for only unique keys ===
         {
             MDBX_txn* txn;
             int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
@@ -117,7 +126,6 @@ public:
                                          + std::string(mdbx_strerror(rc)));
             }
             LOG_DEBUG("LMDB read-only transaction started successfully");
-
             try {
                 int keys_checked = 0;
                 for(auto& tup : id_tuples) {
@@ -126,9 +134,8 @@ public:
                         MDBX_val key{(void*)str_id.c_str(), str_id.size()};
                         MDBX_val data;
 
-                        // Add debug logging
-                        LOG_DEBUG("LMDB: Checking key[" << keys_checked << "]: [" << str_id
-                                                        << "] size: " << str_id.size());
+                        LOG_DEBUG("LMDB: Checking unique key[" << keys_checked << "]: [" << str_id
+                                                               << "] size: " << str_id.size());
                         keys_checked++;
 
                         rc = mdbx_get(txn, dbi_, &key, &data);
@@ -137,10 +144,10 @@ public:
                             LOG_DEBUG("LMDB: ✓ FOUND existing ID: " << existing_id << " for key: ["
                                                                     << str_id << "]");
                             std::get<1>(tup) = existing_id;
-                            std::get<2>(tup) = false;  // ID already exists
+                            std::get<2>(tup) = false;  // not new
                         } else if(rc == MDBX_NOTFOUND) {
                             LOG_DEBUG("LMDB: ✗ NOT FOUND: [" << str_id << "]");
-                            std::get<1>(tup) = 0;
+                            std::get<1>(tup) = 0;  // marker for "needs new id"
                         } else {
                             LOG_DEBUG("LMDB: ERROR for key: [" << str_id
                                                                << "] error: " << mdbx_strerror(rc));
@@ -150,7 +157,7 @@ public:
                         }
                     }
                 }
-                LOG_DEBUG("LMDB: Checked " << keys_checked << " keys in database");
+                LOG_DEBUG("LMDB: Checked " << keys_checked << " unique keys in database");
                 mdbx_txn_abort(txn);
                 LOG_DEBUG("LMDB check done");
             } catch(...) {
@@ -159,58 +166,49 @@ public:
             }
         }
 
-        //Count and generate new IDs
-        LOG_DEBUG("--- STEP 3: Count and generate new IDs ---");
+        // === STEP 3: Count & generate new IDs (for unique keys only) ===
         size_t total_new_ids_needed =
                 std::count_if(id_tuples.begin(), id_tuples.end(), [](const auto& t) {
                     return std::get<1>(t) == 0;
                 });
-        LOG_DEBUG("Total new IDs needed: " << total_new_ids_needed);
+        LOG_DEBUG("Total new unique IDs needed: " << total_new_ids_needed);
 
         size_t fresh_ids_count = total_new_ids_needed;
         size_t deleted_index = 0;
 
         if(use_deleted_ids) {
-            // Use deleted IDs first, but ONLY for entries that are actually new (not found in DB)
             std::vector<idInt> deletedIds = getDeletedIds(fresh_ids_count);
-
             for(auto& tup : id_tuples) {
-                // Only assign deleted IDs to entries that are new (id=0 and is_new=true)
                 if(std::get<1>(tup) == 0 && std::get<2>(tup) == true
                    && deleted_index < deletedIds.size()) {
                     std::get<1>(tup) = deletedIds[deleted_index++];
-                    std::get<3>(tup) = true;  // Mark as reused
-                    // Keep std::get<2>(tup) as true because this still needs to be written to DB
+                    std::get<3>(tup) = true;  // reused
                 }
             }
-            fresh_ids_count -= deleted_index;  // Reduce by actual number of deleted IDs used
+            fresh_ids_count -= deleted_index;
         }
 
+        std::vector<idInt> new_ids;
         if(total_new_ids_needed > 0) {
             LOG_DEBUG("Generating " << fresh_ids_count << " fresh IDs");
-
-            std::vector<idInt> new_ids;
             if(fresh_ids_count > 0) {
                 new_ids = get_next_ids(fresh_ids_count);
             }
 
-            // CRITICAL FIX: Log to WAL AFTER generating IDs (minimal risk window)
+            // Log to WAL (reused + fresh) AFTER generating new_ids
             if(wal_ptr) {
                 WriteAheadLog* wal = static_cast<WriteAheadLog*>(wal_ptr);
                 std::vector<WriteAheadLog::WALEntry> wal_entries;
-
-                // Log reused IDs
+                // reused
                 for(const auto& tup : id_tuples) {
                     if(std::get<2>(tup) && std::get<1>(tup) != 0) {
                         wal_entries.push_back({WALOperationType::VECTOR_ADD, std::get<1>(tup)});
                     }
                 }
-
-                // Log fresh IDs
+                // fresh
                 for(idInt id : new_ids) {
                     wal_entries.push_back({WALOperationType::VECTOR_ADD, id});
                 }
-
                 if(!wal_entries.empty()) {
                     wal->log(wal_entries);
                 }
@@ -222,14 +220,11 @@ public:
                                          + std::to_string(fresh_ids_count));
             }
 
+            // Write to DB (unique keys)
             size_t new_id_index = 0;
-
-            // Step 4: Write txn with auto-resize retry
-            LOG_DEBUG("--- STEP 4: Writing to database ---");
             auto try_write = [&](MDBX_txn* txn) -> int {
                 int writes_attempted = 0;
                 for(auto& tup : id_tuples) {
-                    // Write entries that need to be written to DB (is_new=true) but don't have ID=0
                     if(std::get<2>(tup) == true && std::get<1>(tup) != 0) {
                         const std::string& str_id = std::get<0>(tup);
                         idInt id = std::get<1>(tup);
@@ -237,9 +232,8 @@ public:
                         MDBX_val key{(void*)str_id.c_str(), str_id.size()};
                         MDBX_val data{&id, sizeof(idInt)};
 
-                        // Add debug logging for write operations
-                        LOG_DEBUG("WRITE[" << writes_attempted << "]: key=[" << str_id
-                                           << "] size=" << str_id.size() << " ID=" << id);
+                        LOG_DEBUG("WRITE uniq[" << writes_attempted << "]: key=[" << str_id
+                                                << "] ID=" << id);
                         writes_attempted++;
 
                         int rc = mdbx_put(txn, dbi_, &key, &data, MDBX_UPSERT);
@@ -252,24 +246,19 @@ public:
                                                        << "] error: " << mdbx_strerror(rc));
                             return rc;
                         }
-
-                        LOG_DEBUG("WRITE SUCCESS: [" << str_id << "] with ID: " << id);
+                        LOG_DEBUG("WRITE SUCCESS (unique): [" << str_id << "] with ID: " << id);
 
                     } else if(std::get<1>(tup) == 0) {
-                        // Handle remaining entries that still need new IDs
                         if(new_id_index >= new_ids.size()) {
                             LOG_DEBUG("ERROR: new_id_index ("
                                       << new_id_index << ") >= new_ids.size() (" << new_ids.size()
                                       << ")");
-                            return MDBX_PROBLEM;  // Internal error
+                            return MDBX_PROBLEM;
                         }
                         idInt new_id = new_ids[new_id_index++];
                         const std::string& str_id = std::get<0>(tup);
-
                         MDBX_val key{(void*)str_id.c_str(), str_id.size()};
                         MDBX_val data{&new_id, sizeof(idInt)};
-
-                        writes_attempted++;
 
                         int rc = mdbx_put(txn, dbi_, &key, &data, MDBX_UPSERT);
                         if(rc == MDBX_MAP_FULL) {
@@ -281,7 +270,6 @@ public:
                                                            << "] error: " << mdbx_strerror(rc));
                             return rc;
                         }
-
                         std::get<1>(tup) = new_id;
                     }
                 }
@@ -294,38 +282,52 @@ public:
                 throw std::runtime_error("Failed to begin write transaction: "
                                          + std::string(mdbx_strerror(rc)));
             }
-
             rc = try_write(txn);
-            // MDBX auto-grows, no manual resize needed
             if(rc != MDBX_SUCCESS) {
                 mdbx_txn_abort(txn);
                 throw std::runtime_error("Failed to insert new IDs: "
                                          + std::string(mdbx_strerror(rc)));
             }
-
             rc = mdbx_txn_commit(txn);
             if(rc != MDBX_SUCCESS) {
                 throw std::runtime_error("Failed to commit transaction: "
                                          + std::string(mdbx_strerror(rc)));
             }
-            LOG_DEBUG("Write transaction committed successfully");
+            LOG_DEBUG("Write transaction committed successfully (unique keys)");
         } else {
-            LOG_DEBUG("No new IDs needed, skipping write transaction");
+            LOG_DEBUG("No new unique IDs needed, skipping write transaction");
         }
 
-        // Final state logging
-        LOG_DEBUG("--- FINAL RESULTS ---");
-        std::vector<std::pair<idInt, bool>> result;
-        result.reserve(id_tuples.size());
-        for(size_t i = 0; i < id_tuples.size(); i++) {
-            const auto& tup = id_tuples[i];
+        // === FINAL: Build result vector for original input order ===
+        // Prepare a vector for unique results
+        std::vector<std::pair<idInt, bool>> unique_results;
+        unique_results.reserve(id_tuples.size());
+        for(const auto& tup : id_tuples) {
             bool is_new_to_hnsw = std::get<2>(tup);
-            // If the ID was reused from deleted list, treat it as an update (not new to HNSW)
             if(std::get<3>(tup)) {
+                // if reused from deleted list, it should be considered NOT new to HNSW
                 is_new_to_hnsw = false;
             }
-            result.emplace_back(std::get<1>(tup), is_new_to_hnsw);
+            unique_results.emplace_back(std::get<1>(tup), is_new_to_hnsw);
         }
+
+        // seen_count per unique index to ensure only first occurrence keeps the is_new flag
+        std::vector<size_t> seen_count(unique_results.size(), 0);
+
+        std::vector<std::pair<idInt, bool>> result;
+        result.reserve(str_ids.size());
+        for(const auto& s : str_ids) {
+            size_t uid = unique_index.at(s);  // index into unique_results
+            auto [numid, is_new_flag] = unique_results[uid];
+            // Only the first occurrence keeps the 'new' flag true
+            if(seen_count[uid] > 0 && is_new_flag) {
+                is_new_flag = false;
+            }
+            seen_count[uid] += 1;
+            result.emplace_back(numid, is_new_flag);
+        }
+
+        LOG_DEBUG("--- FINAL RESULTS ---");
         LOG_DEBUG("=== create_ids_batch END ===");
         return result;
     }
