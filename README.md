@@ -221,6 +221,47 @@ You can also use `docker-compose` to run the service.
 
 ---
 
+## 6. Running Docker container from registry
+
+You can run Endee directly using the pre-built image from Docker Hub without building locally.
+
+### Using Docker Compose
+
+Create a new directory for Endee:
+
+```bash
+mkdir endee && cd endee
+```
+
+Inside this directory, create a file named `docker-compose.yml` and copy the following content into it:
+
+```yaml
+services:
+  endee:
+    image: endeeio/endee-server:latest
+    container_name: endee-server
+    ports:
+      - "8080:8080"
+    environment:
+      NDD_NUM_THREADS: 0
+      NDD_AUTH_TOKEN: ""  # Optional: set for authentication
+    volumes:
+      - endee-data:/data
+    restart: unless-stopped
+
+volumes:
+  endee-data:
+```
+
+Then run:
+```bash
+docker compose up -d
+```
+
+for more details visit [docs.endee.io](https://docs.endee.io/quick-start)
+
+---
+
 ## Contribution
 
 We welcome contributions from the community to help make vector search faster and more accessible for everyone. To contribute:
