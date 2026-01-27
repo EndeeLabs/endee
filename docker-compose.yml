@@ -1,7 +1,7 @@
 services:
-  endee-oss:
-    image: endee-oss:latest
-    container_name: endee-oss
+  endee:
+    image: endeeio/endee-server:latest
+    container_name: endee-server
     ports:
       - "8080:8080"
     ulimits:
