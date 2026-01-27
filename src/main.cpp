@@ -96,6 +96,21 @@ json_error_500(const std::string& username, const std::string& path, const std::
     return crow::response(500, err_json.dump());
 }
 
+// Helper function that validates the index name (only alphanumeric character and '_' allowed)
+bool is_valid_index_name(const std::string& name) {
+    if(name.empty() || name.size() > 128) {
+        return false;
+    }
+
+    for(unsigned char c : name) {
+        if(!std::isalnum(c) && c != '_') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 /**
  * Checks if the CPU is compatible with all
  * the instruction sets being used for x86, ARM and MAC Mxx
@@ -304,8 +319,15 @@ int main(int argc, char** argv) {
                     return json_error(400, "Missing required parameters");
                 }
 
+                std::string index_name = body["index_name"].s();
+
+                if(!is_valid_index_name(index_name)) {
+                    return json_error(
+                            400, "Invalid index_name. Only letters, numbers, and '_' are allowed.");
+                }
+
                 // Format index_id as username/index_name
-                std::string index_id = ctx.username + "/" + std::string(body["index_name"].s());
+                std::string index_id = ctx.username + "/" + index_name;
 
                 // Get checksum (optional, for queryable encryption)
                 int32_t checksum = body.has("checksum") ? body["checksum"].i() : -1;
