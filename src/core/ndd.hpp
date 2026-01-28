@@ -550,20 +550,22 @@ public:
     }
 
     // Helper method to validate backup names
-    void validateBackupName(const std::string& backup_name) const {
+    std::pair<bool, std::string> validateBackupName(const std::string& backup_name) const {
         if(backup_name.empty()) {
-            throw std::runtime_error("Backup name cannot be empty");
+            return std::make_pair(false, "Backup name cannot be empty");
         }
 
         // Check length limit (most filesystems limit to 255 chars)
         if(backup_name.length() > MAX_BACKUP_NAME_LENGTH) {
-            throw std::runtime_error("Backup name too long (max "
-                                     + std::to_string(MAX_BACKUP_NAME_LENGTH) + " characters)");
+            return std::make_pair(false,
+                                  "Backup name too long (max "
+                                          + std::to_string(MAX_BACKUP_NAME_LENGTH)
+                                          + " characters)");
         }
 
         // Check for reserved names
         if(backup_name == "." || backup_name == "..") {
-            throw std::runtime_error("Invalid backup name: cannot be '.' or '..'");
+            return std::make_pair(false, "Invalid backup name: cannot be '.' or '..'");
         }
 
         // Check for reserved/problematic names (cross-platform)
@@ -578,7 +580,7 @@ public:
            || lower_name == "lpt1" || lower_name == "lpt2" || lower_name == "lpt3"
            || lower_name == "lpt4" || lower_name == "lpt5" || lower_name == "lpt6"
            || lower_name == "lpt7" || lower_name == "lpt8" || lower_name == "lpt9") {
-            throw std::runtime_error("Invalid backup name: reserved system name (Windows)");
+            return std::make_pair(false, "Invalid backup name: reserved system name (Windows)");
         }
 
         // Unix/Linux/macOS device names (could cause confusion)
@@ -589,29 +591,30 @@ public:
            || lower_name == "stderr" || lower_name == "tty" || lower_name == "console"
            || lower_name == "kmem" || lower_name == "mem" || lower_name == "core"
            || lower_name == "full" || lower_name == "ptmx") {
-            throw std::runtime_error("Invalid backup name: device/system name (Unix/Linux)");
+            return std::make_pair(false, "Invalid backup name: device/system name (Unix/Linux)");
         }
 
         // Prevent hidden files (names starting with dot)
         if(backup_name[0] == '.') {
-            throw std::runtime_error("Invalid backup name: cannot start with '.'");
+            return std::make_pair(false, "Invalid backup name: cannot start with '.'");
         }
 
         // Prevent trailing dots or spaces (Windows issue)
         char last_char = backup_name[backup_name.length() - 1];
         if(last_char == '.' || last_char == ' ') {
-            throw std::runtime_error("Invalid backup name: cannot end with '.' or space");
+            return std::make_pair(false, "Invalid backup name: cannot end with '.' or space");
         }
 
         // Prevent leading/trailing whitespace
         if(std::isspace(backup_name[0]) || std::isspace(last_char)) {
-            throw std::runtime_error("Invalid backup name: cannot start or end with whitespace");
+            return std::make_pair(false,
+                                  "Invalid backup name: cannot start or end with whitespace");
         }
 
         // Check for path traversal attacks
         if(backup_name.find("..") != std::string::npos || backup_name.find('/') != std::string::npos
            || backup_name.find('\\') != std::string::npos) {
-            throw std::runtime_error("Invalid backup name: cannot contain '..', '/', or '\\'");
+            return std::make_pair(false, "Invalid backup name: cannot contain '..', '/', or '\\'");
         }
 
         // Check for dangerous characters (null bytes, control chars, colons, etc.)
@@ -620,33 +623,40 @@ public:
 
             // Check for null bytes
             if(c == '\0') {
-                throw std::runtime_error("Invalid backup name: cannot contain null bytes");
+                std::cout << "Invalid backup name: cannot contain null bytes at " << i << std::endl;
+                return std::make_pair(false, "Invalid backup name: cannot contain null bytes");
             }
 
             // Check for control characters
             if(std::iscntrl(c)) {
-                throw std::runtime_error("Invalid backup name: cannot contain control characters");
+                return std::make_pair(false,
+                                      "Invalid backup name: cannot contain control characters");
             }
 
             // Check for dangerous characters
             if(c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|'
                || c == '&' || c == ';' || c == '$' || c == '`' || c == '\'' || c == '('
                || c == ')') {
-                throw std::runtime_error("Invalid backup name: contains forbidden characters");
+                return std::make_pair(false, "Invalid backup name: contains forbidden characters");
             }
 
             // Only allow alphanumeric, hyphens, underscores, dots, and spaces
             if(!std::isalnum(c) && c != '-' && c != '_' && c != '.' && c != ' ') {
-                throw std::runtime_error("Invalid backup name: only alphanumeric, hyphens, "
-                                         "underscores, dots, and spaces allowed");
+                return std::make_pair(false,
+                                      "Invalid backup name: only alphanumeric, hyphens, "
+                                      "underscores, dots, and spaces allowed");
             }
         }
+        return std::make_pair(true, "");
     }
 
     // Backup methods
     void createBackup(const std::string& index_id, const std::string& backup_name) {
         // 1. Validate backup name
-        validateBackupName(backup_name);
+        std::pair<bool, std::string> result = validateBackupName(backup_name);
+        if(!result.first) {
+            throw std::runtime_error(result.second);
+        }
 
         // 2. Parse user and index name
         std::string user_id, index_name;
@@ -745,7 +755,10 @@ public:
 
     void restoreBackup(const std::string& backup_name, const std::string& target_index_name) {
         // 1. Validate backup name
-        validateBackupName(backup_name);
+        std::pair<bool, std::string> result = validateBackupName(backup_name);
+        if(!result.first) {
+            throw std::runtime_error(result.second);
+        }
 
         // Use default username for single-user system
         std::string user_id = settings::DEFAULT_USERNAME;
@@ -825,7 +838,10 @@ public:
 
     void deleteBackup(const std::string& backup_name) {
         // Validate backup name
-        validateBackupName(backup_name);
+        std::pair<bool, std::string> result = validateBackupName(backup_name);
+        if(!result.first) {
+            throw std::runtime_error(result.second);
+        }
 
         std::string backup_tar = data_dir_ + "/backups/" + backup_name + ".tar.gz";
         if(std::filesystem::exists(backup_tar)) {

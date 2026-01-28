@@ -470,6 +470,113 @@ int main(int argc, char** argv) {
                 }
             });
 
+    // Download Backup
+    CROW_ROUTE(app, "/api/v1/backups/<string>/download")
+            .CROW_MIDDLEWARES(app, AuthMiddleware)
+            .methods("GET"_method)([&index_manager, &app](const crow::request& req,
+                                                          const std::string& backup_name) {
+                auto& ctx = app.get_context<AuthMiddleware>(req);
+                try {
+                    std::string backup_tar =
+                            settings::DATA_DIR + "/backups/" + backup_name + ".tar.gz";
+                    if(!std::filesystem::exists(backup_tar)) {
+                        return json_error(404, "Backup not found");
+                    }
+                    std::string file_content = read_file(backup_tar);
+                    if(file_content.empty()) {
+                        return json_error(500, "Failed to read backup file");
+                    }
+                    crow::response response;
+                    response.set_header("Content-Type", "application/gzip");
+                    response.set_header("Content-Disposition",
+                                        "attachment; filename=\"" + backup_name + ".tar.gz\"");
+                    response.set_header("Content-Length", std::to_string(file_content.size()));
+                    response.set_header("Cache-Control", "no-cache");
+                    response.body = std::move(file_content);
+                    return response;
+                } catch(const std::exception& e) {
+                    return json_error(500, e.what());
+                }
+            });
+
+    // upload Backup
+    CROW_ROUTE(app, "/api/v1/backups/upload")
+            .CROW_MIDDLEWARES(app, AuthMiddleware)
+            .methods("POST"_method)([&index_manager, &app](const crow::request& req) {
+                auto& ctx = app.get_context<AuthMiddleware>(req);
+                try {
+                    // Parse multipart message
+                    crow::multipart::message msg(req);
+
+                    // Find the file part
+                    std::string backup_name;
+                    std::string file_content;
+
+                    for(const auto& part : msg.parts) {
+                        auto content_disposition = part.get_header_object("Content-Disposition");
+                        std::string name = content_disposition.params.count("name")
+                                                   ? content_disposition.params.at("name")
+                                                   : "";
+
+                        if(name == "backup") {
+                            // Get filename from Content-Disposition
+                            if(content_disposition.params.count("filename")) {
+                                backup_name = content_disposition.params.at("filename");
+                                // check if backup name ends with .tar.gz
+                                if(backup_name.ends_with(".tar.gz")) {
+                                    backup_name = backup_name.substr(0, backup_name.size() - 7);
+                                } else {
+                                    return json_error(400, "Invalid backup file extension");
+                                }
+                            }
+                            file_content = part.body;
+                            break;
+                        }
+                    }
+
+                    if(backup_name.empty()) {
+                        return json_error(400, "Missing backup name or filename");
+                    }
+
+                    if(file_content.empty()) {
+                        return json_error(400, "Missing backup file content");
+                    }
+
+                    // Validate backup name
+                    std::pair<bool, std::string> result =
+                            index_manager.validateBackupName(backup_name);
+                    if(!result.first) {
+                        return json_error(400, result.second);
+                    }
+
+                    // Check if backup already exists
+                    std::string backup_path =
+                            settings::DATA_DIR + "/backups/" + backup_name + ".tar.gz";
+                    if(std::filesystem::exists(backup_path)) {
+                        return json_error(409,
+                                          "Backup with name '" + backup_name + "' already exists");
+                    }
+
+                    // Write the file
+                    std::ofstream out(backup_path, std::ios::binary);
+                    if(!out.is_open()) {
+                        return json_error(500, "Failed to create backup file");
+                    }
+                    out.write(file_content.data(), file_content.size());
+                    out.close();
+
+                    if(!out.good()) {
+                        // Clean up partial file on error
+                        std::filesystem::remove(backup_path);
+                        return json_error(500, "Failed to write backup file");
+                    }
+
+                    return crow::response(201, "Backup uploaded successfully");
+                } catch(const std::exception& e) {
+                    return json_error(500, e.what());
+                }
+            });
+
     // List indexes for current user
     CROW_ROUTE(app, "/api/v1/index/list")
             .CROW_MIDDLEWARES(app, AuthMiddleware)
