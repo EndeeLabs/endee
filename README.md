@@ -136,7 +136,7 @@ The output binary name depends on the SIMD flag used during compilation:
 
 ### Runtime Environment Variables
 
-Some enviroment variables **ndd** reads at runtime:
+Some environment variables **ndd** reads at runtime:
 
 * `NDD_DATA_DIR`: Defines the data directory
 * `NDD_AUTH_TOKEN`: Optional authentication token (see below)
