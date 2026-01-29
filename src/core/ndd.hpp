@@ -651,11 +651,12 @@ public:
     }
 
     // Backup methods
-    void createBackup(const std::string& index_id, const std::string& backup_name) {
+    std::pair<bool, std::string> createBackup(const std::string& index_id,
+                                              const std::string& backup_name) {
         // 1. Validate backup name
         std::pair<bool, std::string> result = validateBackupName(backup_name);
         if(!result.first) {
-            throw std::runtime_error(result.second);
+            return result;
         }
 
         // 2. Parse user and index name
@@ -665,7 +666,7 @@ public:
             user_id = index_id.substr(0, pos);
             index_name = index_id.substr(pos + 1);
         } else {
-            throw std::runtime_error("Invalid index ID format");
+            return {false, "Invalid index ID format"};
         }
 
         // 3. Get index entry and lock
@@ -682,7 +683,7 @@ public:
         std::string source_dir = data_dir_ + "/" + index_id;
 
         if(std::filesystem::exists(backup_tar)) {
-            throw std::runtime_error("Backup already exists: " + backup_name);
+            return {false, "Backup already exists: " + backup_name};
         }
 
         // 6. Copy files to temporary directory
@@ -721,13 +722,14 @@ public:
         if(!ndd::ArchiveUtils::createTarGz(backup_dir, backup_tar, error_msg)) {
             // Clean up on failure
             std::filesystem::remove_all(backup_dir);
-            throw std::runtime_error("Failed to create compressed backup archive: " + error_msg);
+            return {false, "Failed to create compressed backup archive: " + error_msg};
         }
 
         // 8. Remove the temporary uncompressed directory
         std::filesystem::remove_all(backup_dir);
 
         LOG_INFO("Created compressed backup: " << backup_tar);
+        return {true, ""};
     }
 
     std::vector<std::string> listBackups() {
@@ -753,11 +755,12 @@ public:
         return backups;
     }
 
-    void restoreBackup(const std::string& backup_name, const std::string& target_index_name) {
+    std::pair<bool, std::string> restoreBackup(const std::string& backup_name,
+                                               const std::string& target_index_name) {
         // 1. Validate backup name
         std::pair<bool, std::string> result = validateBackupName(backup_name);
         if(!result.first) {
-            throw std::runtime_error(result.second);
+            return result;
         }
 
         // Use default username for single-user system
@@ -770,16 +773,16 @@ public:
 
         // 2. Validation - check for tar.gz file
         if(!std::filesystem::exists(backup_tar)) {
-            throw std::runtime_error("Backup not found: " + backup_name);
+            return {false, "Backup not found: " + backup_name};
         }
         if(metadata_manager_->getMetadata(target_index_id).has_value()) {
-            throw std::runtime_error("Target index already exists");
+            return {false, "Target index already exists"};
         }
 
         // 3. Extract tar.gz to temporary directory using libarchive
         std::string error_msg;
         if(!ndd::ArchiveUtils::extractTarGz(backup_tar, backup_extract_dir, error_msg)) {
-            throw std::runtime_error("Failed to extract backup archive: " + error_msg);
+            return {false, "Failed to extract backup archive: " + error_msg};
         }
 
         // check if any folder is present in backup_extract_dir
@@ -792,7 +795,7 @@ public:
 
         if(folders.size() != 1) {
             std::filesystem::remove_all(backup_extract_dir);
-            throw std::runtime_error("Backup extraction failed - directory not found");
+            return {false, "Backup extraction failed - directory not found"};
         }
 
         std::string backup_dir = folders[0];
@@ -802,7 +805,7 @@ public:
             std::ifstream f(backup_dir + "/metadata.json");
             if(!f.good()) {
                 std::filesystem::remove_all(backup_extract_dir);
-                throw std::runtime_error("Backup metadata missing");
+                return {false, "Backup metadata missing"};
             }
             nlohmann::json meta_json = nlohmann::json::parse(f);
 
@@ -839,26 +842,28 @@ public:
             loadIndex(target_index_id);
 
             LOG_INFO("Restored backup from compressed archive: " << backup_tar);
+            return {true, ""};
         } catch(const std::exception& e) {
             // Clean up on failure
             std::filesystem::remove_all(backup_extract_dir);
-            throw;
+            return {false, "Failed to restore backup: " + std::string(e.what())};
         }
     }
 
-    void deleteBackup(const std::string& backup_name) {
+    std::pair<bool, std::string> deleteBackup(const std::string& backup_name) {
         // Validate backup name
         std::pair<bool, std::string> result = validateBackupName(backup_name);
         if(!result.first) {
-            throw std::runtime_error(result.second);
+            return result;
         }
 
         std::string backup_tar = data_dir_ + "/backups/" + backup_name + ".tar.gz";
         if(std::filesystem::exists(backup_tar)) {
             std::filesystem::remove(backup_tar);
             LOG_INFO("Deleted compressed backup: " << backup_tar);
+            return {true, ""};
         } else {
-            throw std::runtime_error("Backup not found");
+            return {false, "Backup not found"};
         }
     }
 

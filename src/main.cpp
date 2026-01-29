@@ -409,8 +409,12 @@ int main(int argc, char** argv) {
                 std::string index_id = ctx.username + "/" + index_name;
 
                 try {
-                    index_manager.createBackup(index_id, backup_name);
-                    return crow::response(200, "Backup created successfully");
+                    std::pair<bool, std::string> result =
+                            index_manager.createBackup(index_id, backup_name);
+                    if(!result.first) {
+                        return json_error(400, result.second);
+                    }
+                    return crow::response(201, "Backup created successfully");
                 } catch(const std::exception& e) {
                     return json_error(500, e.what());
                 }
@@ -449,8 +453,12 @@ int main(int argc, char** argv) {
                 std::string target_index_name = body["target_index_name"].s();
 
                 try {
-                    index_manager.restoreBackup(backup_name, target_index_name);
-                    return crow::response(200, "Backup restored successfully");
+                    std::pair<bool, std::string> result =
+                            index_manager.restoreBackup(backup_name, target_index_name);
+                    if(!result.first) {
+                        return json_error(400, result.second);
+                    }
+                    return crow::response(201, "Backup restored successfully");
                 } catch(const std::exception& e) {
                     return json_error(500, e.what());
                 }
@@ -463,8 +471,11 @@ int main(int argc, char** argv) {
                                                              const std::string& backup_name) {
                 auto& ctx = app.get_context<AuthMiddleware>(req);
                 try {
-                    index_manager.deleteBackup(backup_name);
-                    return crow::response(200, "Backup deleted successfully");
+                    std::pair<bool, std::string> result = index_manager.deleteBackup(backup_name);
+                    if(!result.first) {
+                        return json_error(400, result.second);
+                    }
+                    return crow::response(204, "Backup deleted successfully");
                 } catch(const std::exception& e) {
                     return json_error(500, e.what());
                 }
