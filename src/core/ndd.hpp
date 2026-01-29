@@ -1435,6 +1435,12 @@ public:
                 // Mark as deleted in HNSW index
                 entry.alg->markDelete(numeric_id);
             }
+            
+            // Delete from sparse storage if it exists
+            if(entry.sparse_storage) {
+                 entry.sparse_storage->delete_vectors_batch(numeric_ids);
+            }
+
             // Add the list to write ahead log using IndexManager's method
             logDeletions(entry.index_id, numeric_ids);
 

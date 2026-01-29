@@ -666,6 +666,11 @@ int main(int argc, char** argv) {
                                 vec.sparse_values.push_back(static_cast<float>(v.d()));
                             }
                         }
+                        
+                        if(item.has("metadata")) {
+                             crow::json::wvalue col(item["metadata"]);
+                             vec.filter = col.dump();
+                        }
                         return vec;
                     };
 
