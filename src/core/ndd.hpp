@@ -764,7 +764,7 @@ public:
         std::string user_id = settings::DEFAULT_USERNAME;
         std::string backup_dir_root = data_dir_ + "/backups";
         std::string backup_tar = backup_dir_root + "/" + backup_name + ".tar.gz";
-        std::string backup_dir = backup_dir_root + "/" + backup_name;
+        std::string backup_extract_dir = backup_dir_root + "/" + backup_name;
         std::string target_index_id = user_id + "/" + target_index_name;
         std::string target_dir = data_dir_ + "/" + target_index_id;
 
@@ -778,20 +778,30 @@ public:
 
         // 3. Extract tar.gz to temporary directory using libarchive
         std::string error_msg;
-        if(!ndd::ArchiveUtils::extractTarGz(backup_tar, backup_dir_root, error_msg)) {
+        if(!ndd::ArchiveUtils::extractTarGz(backup_tar, backup_extract_dir, error_msg)) {
             throw std::runtime_error("Failed to extract backup archive: " + error_msg);
         }
 
-        // Ensure backup directory was extracted
-        if(!std::filesystem::exists(backup_dir)) {
+        // check if any folder is present in backup_extract_dir
+        std::vector<std::string> folders;
+        for(const auto& entry : std::filesystem::directory_iterator(backup_extract_dir)) {
+            if(entry.is_directory()) {
+                folders.push_back(entry.path().string());
+            }
+        }
+
+        if(folders.size() != 1) {
+            std::filesystem::remove_all(backup_extract_dir);
             throw std::runtime_error("Backup extraction failed - directory not found");
         }
+
+        std::string backup_dir = folders[0];
 
         try {
             // 3. Read metadata
             std::ifstream f(backup_dir + "/metadata.json");
             if(!f.good()) {
-                std::filesystem::remove_all(backup_dir);
+                std::filesystem::remove_all(backup_extract_dir);
                 throw std::runtime_error("Backup metadata missing");
             }
             nlohmann::json meta_json = nlohmann::json::parse(f);
@@ -823,7 +833,7 @@ public:
             metadata_manager_->storeMetadata(target_index_id, new_meta);
 
             // 6. Clean up extracted temporary directory
-            std::filesystem::remove_all(backup_dir);
+            std::filesystem::remove_all(backup_extract_dir);
 
             // 7. Load index
             loadIndex(target_index_id);
@@ -831,7 +841,7 @@ public:
             LOG_INFO("Restored backup from compressed archive: " << backup_tar);
         } catch(const std::exception& e) {
             // Clean up on failure
-            std::filesystem::remove_all(backup_dir);
+            std::filesystem::remove_all(backup_extract_dir);
             throw;
         }
     }
