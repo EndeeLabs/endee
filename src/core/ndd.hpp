@@ -1,4 +1,4 @@
-c#pragma once
+c #pragma once
 #include <curl/curl.h>
 #include "hnsw/hnswlib.h"
 #include "settings.hpp"
@@ -29,7 +29,7 @@ c#pragma once
 
 #define MAX_BACKUP_NAME_LENGTH 200
 
-struct IndexConfig {
+        struct IndexConfig {
     size_t dim;
     size_t sparse_dim = 0;  // 0 means dense-only
     size_t max_elements = settings::MAX_ELEMENTS;
@@ -56,7 +56,7 @@ struct IndexInfo {
 struct CacheEntry {
     std::string index_id;
 
-    std::mutex operation_mutex;// adding a field
+    std::mutex operation_mutex;  // adding a field
     // Track deleted vector IDs for filtering during search
     std::unordered_set<ndd::idInt> deleted_ids;
     std::shared_mutex deleted_ids_mutex;  // Protect concurrent access
@@ -186,65 +186,60 @@ private:
         auto& entry = getIndexEntry(index_id);
         WriteAheadLog* wal = getOrCreateWAL(index_id);
 
-        // Check if WAL has entries needing recovery
         if(wal->hasEntries()) {
             LOG_INFO("WAL recovery needed for index " << index_id);
-
             auto wal_entries = wal->readEntries();
+
+            // Track deletes during recovery
+            std::unordered_set<ndd::idInt> recovered_deletes;
             LOG_INFO("Read " << wal_entries.size() << " entries from WAL");
 
-            // Process all entries in the exact order they were recorded
             std::vector<idInt> failed_vector_add_ids;
 
             for(const auto& wal_entry : wal_entries) {
                 try {
                     if(wal_entry.op_type == WALOperationType::VECTOR_ADD) {
-                        // Check if vector exists in storage before recovering
                         auto vector_bytes = entry.vector_storage->get_vector(wal_entry.numeric_id);
                         if(!vector_bytes.empty()) {
                             entry.alg->addPoint<true>(vector_bytes.data(), wal_entry.numeric_id);
+                            // Remove from deletes if it was there
+                            recovered_deletes.erase(wal_entry.numeric_id);
                         } else {
-                            // Vector doesn't exist - this VECTOR_ADD failed
                             failed_vector_add_ids.push_back(wal_entry.numeric_id);
-                            LOG_DEBUG("VECTOR_ADD failed for ID " << wal_entry.numeric_id
-                                                                  << " - adding to deleted_ids");
+                            LOG_DEBUG("VECTOR_ADD failed for ID " << wal_entry.numeric_id);
                         }
                     } else if(wal_entry.op_type == WALOperationType::VECTOR_UPDATE) {
-                        // Recover vector update
                         auto vector_bytes = entry.vector_storage->get_vector(wal_entry.numeric_id);
                         if(!vector_bytes.empty()) {
                             entry.alg->addPoint<false>(vector_bytes.data(), wal_entry.numeric_id);
                         }
                     } else if(wal_entry.op_type == WALOperationType::VECTOR_DELETE) {
-                        // For deletions, just mark the vector as deleted
                         entry.alg->markDelete(wal_entry.numeric_id);
+                        // Track deletion
+                        recovered_deletes.insert(wal_entry.numeric_id);
                     }
                 } catch(const std::exception& e) {
                     if(wal_entry.op_type == WALOperationType::VECTOR_ADD) {
-                        // If VECTOR_ADD recovery failed, add ID to failed list
                         failed_vector_add_ids.push_back(wal_entry.numeric_id);
-                        LOG_DEBUG("VECTOR_ADD recovery failed for ID " << wal_entry.numeric_id
-                                                                       << ": " << e.what());
+                        LOG_DEBUG("VECTOR_ADD recovery failed: " << e.what());
                     } else {
-                        LOG_DEBUG("Failed to recover operation for vector " << wal_entry.numeric_id
-                                                                            << ": " << e.what());
+                        LOG_DEBUG("Failed to recover operation: " << e.what());
                     }
                 }
             }
 
-            // Add failed VECTOR_ADD IDs back to deleted_ids for reuse
             if(!failed_vector_add_ids.empty()) {
                 entry.id_mapper->reclaim_failed_ids(failed_vector_add_ids);
-                LOG_INFO("Reclaimed " << failed_vector_add_ids.size()
-                                      << " failed VECTOR_ADD IDs for reuse");
+                LOG_INFO("Reclaimed " << failed_vector_add_ids.size() << " failed IDs");
             }
 
-            // Mark as updated to trigger a save
+            // Update the deleted_ids set with recovered deletions
+            {
+                std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+                entry.deleted_ids = std::move(recovered_deletes);
+            }
+
             entry.markUpdated();
-            // Explicitly save the index after recovery
-            LOG_DEBUG("Saving index after WAL recovery: " << index_id);
-            // Save index will also clear the WAL and save bloom filter
-            // FIX: Call saveIndexInternal instead of saveIndex to avoid circular lock
             saveIndexInternal(entry);
         }
     }
@@ -1432,8 +1427,8 @@ public:
     // meta, vector data Meta and vector data will be overwritten when the id is reused
     bool deleteVectorsByIds(CacheEntry& entry, const std::vector<ndd::idInt>& numeric_ids) {
         try {
-             // Lock for updating deleted_ids set
-             std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+            // Lock for updating deleted_ids set
+            std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
             for(ndd::idInt numeric_id : numeric_ids) {
                 auto meta = entry.vector_storage->get_meta(numeric_id);
                 // Remove ID mapping by getting the string id from metadata
@@ -1652,31 +1647,31 @@ public:
             // CRITICAL FIX: This must happen BEFORE combining results to ensure
             // deleted vectors don't affect RRF scoring or appear in results
             std::vector<std::pair<float, ndd::idInt>> filtered_dense;
-            if (!dense_results.empty()) {
+            if(!dense_results.empty()) {
                 std::shared_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
                 filtered_dense.reserve(dense_results.size());
-                for (const auto& p : dense_results) {
-                // Check if vector is in deleted set
-                    if (entry.deleted_ids.find(p.second) == entry.deleted_ids.end()) {
-                    filtered_dense.push_back(p);
+                for(const auto& p : dense_results) {
+                    // Check if vector is in deleted set
+                    if(entry.deleted_ids.find(p.second) == entry.deleted_ids.end()) {
+                        filtered_dense.push_back(p);
+                    }
                 }
-            }
-            LOG_DEBUG("Dense search: " << dense_results.size() << " results, " 
-                    << filtered_dense.size() << " after deletion filter");
+                LOG_DEBUG("Dense search: " << dense_results.size() << " results, "
+                                           << filtered_dense.size() << " after deletion filter");
             }
 
             std::vector<std::pair<ndd::idInt, float>> filtered_sparse;
-            if (!sparse_results.empty()) {
+            if(!sparse_results.empty()) {
                 std::shared_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
                 filtered_sparse.reserve(sparse_results.size());
-                for (const auto& p : sparse_results) {
+                for(const auto& p : sparse_results) {
                     // Check if vector is in deleted set
-                    if (entry.deleted_ids.find(p.first) == entry.deleted_ids.end()) {
+                    if(entry.deleted_ids.find(p.first) == entry.deleted_ids.end()) {
                         filtered_sparse.push_back(p);
                     }
                 }
-            LOG_DEBUG("Sparse search: " << sparse_results.size() << " results, " 
-                    << filtered_sparse.size() << " after deletion filter");
+                LOG_DEBUG("Sparse search: " << sparse_results.size() << " results, "
+                                            << filtered_sparse.size() << " after deletion filter");
             }
 
             // Use filtered results for combination
