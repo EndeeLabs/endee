@@ -1628,24 +1628,63 @@ public:
             }
 
             // 3. Combine Results
-            std::vector<std::pair<float, ndd::idInt>> final_candidates;
+            // std::vector<std::pair<float, ndd::idInt>> final_candidates;
 
-            if(dense_results.empty() && sparse_results.empty()) {
-                return std::vector<ndd::VectorResult>();
-            } else if(sparse_results.empty()) {
-                // Only dense results
-                final_candidates.reserve(dense_results.size());
-                for(const auto& p : dense_results) {
-                    final_candidates.emplace_back(p.first, p.second);
+            // if(dense_results.empty() && sparse_results.empty()) {
+            //     return std::vector<ndd::VectorResult>();
+            // } else if(sparse_results.empty()) {
+            //     // Only dense results
+            //     final_candidates.reserve(dense_results.size());
+            //     for(const auto& p : dense_results) {
+            //         final_candidates.emplace_back(p.first, p.second);
+            //     }
+            // } else if(dense_results.empty()) {
+            //     // Only sparse results
+            //     final_candidates.reserve(sparse_results.size());
+            //     for(const auto& p : sparse_results) {
+            //         final_candidates.emplace_back(p.second, p.first);
+            //     }
+            // }
+
+            // 3. Filter out deleted vectors from BOTH dense and sparse results
+            // CRITICAL FIX: This must happen BEFORE combining results to ensure
+            // deleted vectors don't affect RRF scoring or appear in results
+            std::vector<std::pair<float, ndd::idInt>> filtered_dense;
+            if (!dense_results.empty()) {
+                std::shared_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+                filtered_dense.reserve(dense_results.size());
+                for (const auto& p : dense_results) {
+                // Check if vector is in deleted set
+                    if (entry.deleted_ids.find(p.second) == entry.deleted_ids.end()) {
+                    filtered_dense.push_back(p);
                 }
-            } else if(dense_results.empty()) {
-                // Only sparse results
-                final_candidates.reserve(sparse_results.size());
-                for(const auto& p : sparse_results) {
-                    final_candidates.emplace_back(p.second, p.first);
+            }
+            LOG_DEBUG("Dense search: " << dense_results.size() << " results, " 
+                    << filtered_dense.size() << " after deletion filter");
+            }
+
+            std::vector<std::pair<ndd::idInt, float>> filtered_sparse;
+            if (!sparse_results.empty()) {
+                std::shared_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+                filtered_sparse.reserve(sparse_results.size());
+                for (const auto& p : sparse_results) {
+                    // Check if vector is in deleted set
+                    if (entry.deleted_ids.find(p.first) == entry.deleted_ids.end()) {
+                        filtered_sparse.push_back(p);
+                    }
                 }
-            } else {
-                // Hybrid results - RRF
+            LOG_DEBUG("Sparse search: " << sparse_results.size() << " results, " 
+                    << filtered_sparse.size() << " after deletion filter");
+            }
+
+            // Use filtered results for combination
+            dense_results = std::move(filtered_dense);
+            sparse_results = std::move(filtered_sparse);
+
+            // 4. Combine Results (now using filtered results)
+            std::vector<std::pair<float, ndd::idInt>> final_candidates;
+            else {
+                // Hybrid results - RRF (now without deleted vectors)
                 std::unordered_map<ndd::idInt, float> combined_scores;
                 const float k_rrf = 60.0f;
 
