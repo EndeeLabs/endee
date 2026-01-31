@@ -1426,6 +1426,8 @@ public:
     // meta, vector data Meta and vector data will be overwritten when the id is reused
     bool deleteVectorsByIds(CacheEntry& entry, const std::vector<ndd::idInt>& numeric_ids) {
         try {
+             // Lock for updating deleted_ids set
+             std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
             for(ndd::idInt numeric_id : numeric_ids) {
                 auto meta = entry.vector_storage->get_meta(numeric_id);
                 // Remove ID mapping by getting the string id from metadata
@@ -1443,6 +1445,8 @@ public:
                 if(entry.sparse_storage) {
                     entry.sparse_storage->delete_vector(numeric_id);
                 }
+                // Track deletion in set (add after sparse_storage delete)
+                entry.deleted_ids.insert(numeric_id);
             }
             // Add the list to write ahead log using IndexManager's method
             logDeletions(entry.index_id, numeric_ids);
