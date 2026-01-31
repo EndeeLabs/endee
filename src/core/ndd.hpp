@@ -1,4 +1,4 @@
-#pragma once
+c#pragma once
 #include <curl/curl.h>
 #include "hnsw/hnswlib.h"
 #include "settings.hpp"
@@ -55,6 +55,11 @@ struct IndexInfo {
 
 struct CacheEntry {
     std::string index_id;
+
+    std::mutex operation_mutex;// adding a field
+    // Track deleted vector IDs for filtering during search
+    std::unordered_set<ndd::idInt> deleted_ids;
+    std::shared_mutex deleted_ids_mutex;  // Protect concurrent access
     size_t sparse_dim = 0;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> alg;
     std::shared_ptr<IDMapper> id_mapper;
