@@ -327,3 +327,6 @@ endif()
 message(STATUS "ASIO include dir: ${ASIO_INCLUDE_DIR}")
 message(STATUS "LMDB include dir: ${LMDB_INCLUDE_DIR}")
 message(STATUS "OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
+# Add test executable
+add_executable(test_hybrid_deletion tests/test_hybrid_deletion.cpp)
+target_link_libraries(test_hybrid_deletion endee pthread)
