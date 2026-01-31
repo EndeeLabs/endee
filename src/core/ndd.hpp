@@ -378,6 +378,8 @@ private:
             std::cerr << "Warning: Failed to update element count in metadata for "
                       << entry.index_id << std::endl;
         }
+        std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+        entry.deleted_ids.clear();
         entry.updated = false;
     }
 
