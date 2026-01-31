@@ -1158,7 +1158,11 @@ public:
                 numeric_ids = entry.id_mapper->create_ids_batch<false>(str_ids, wal);
             }
             LOG_DEBUG("Created " << numeric_ids.size() << " numeric IDs for string IDs");
-
+            // Clear deleted status for reused IDs
+            std::unique_lock<std::shared_mutex> lock(entry.deleted_ids_mutex);
+            for(const auto& [numeric_id, is_new] : numeric_ids) {
+                entry.deleted_ids.erase(numeric_id);
+            }
             // Handle Sparse Vectors if storage is initialized
             if(entry.sparse_storage) {
                 if constexpr(std::is_same_v<VectorType, ndd::HybridVectorObject>) {
