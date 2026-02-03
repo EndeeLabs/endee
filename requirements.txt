@@ -1,0 +1,3 @@
+sentence-transformers
+numpy
+streamlit
