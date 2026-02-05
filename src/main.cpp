@@ -393,6 +393,29 @@ int main(int argc, char** argv) {
                 }
             });
 
+
+    // Put Index in cold storage (DONT_NEED)
+    CROW_ROUTE(app, "/api/v1/index/<string>/archive")
+            .CROW_MIDDLEWARES(app, AuthMiddleware)
+            .methods("POST"_method)([&index_manager, &app](const crow::request& req,
+                                                           const std::string& index_name) {
+                auto& ctx = app.get_context<AuthMiddleware>(req);
+
+                std::string backup_name = ctx.username + "_" + index_name;
+                std::string index_id = ctx.username + "/" + index_name;
+
+                try {
+                    std::pair<bool, std::string> result =
+                            index_manager.archive_index(index_id, backup_name);
+                    if(!result.first) {
+                        return json_error(400, result.second);
+                    }
+                    return crow::response(201, "Backup created successfully");
+                } catch(const std::exception& e) {
+                    return json_error(500, e.what());
+                }
+            });
+
     // Create Backup
     CROW_ROUTE(app, "/api/v1/index/<string>/backup")
             .CROW_MIDDLEWARES(app, AuthMiddleware)
