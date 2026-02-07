@@ -46,7 +46,7 @@ main() {
     done
 
     if [[ -z "$BINARY_FILE" ]]; then
-        # check if build folder exists and if any binary starting with ndd-* exists, fi yes then save the filename in a variable
+        # check if build folder exists and if any binary starting with ndd-* exists, if yes then save the filename in a variable
         if [[ -d "build" && -n "$(find build -maxdepth 1 -name 'ndd-*' -type f)" ]]; then
             BINARY_FILE=$(find build -maxdepth 1 -name 'ndd-*' -type f | head -n 1)
             log "Found binary: $BINARY_FILE"
