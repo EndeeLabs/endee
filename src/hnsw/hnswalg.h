@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <shared_mutex>
 #include <memory>
+#include <type_traits>
 
 namespace hnswlib {
 
@@ -208,11 +209,12 @@ namespace hnswlib {
         // Cache management getters/setters
         // Removed as cache is managed externally
 
+        template <typename FilterFunctor>
         std::vector<std::pair<dist_t, idInt>>
         searchKnn(const void* query_data,
                   size_t k,
-                  size_t ef = settings::DEFAULT_EF_SEARCH,
-                  BaseFilterFunctor* isIdAllowed = nullptr) const override {
+                  size_t ef,
+                  FilterFunctor* isIdAllowed) const {
             int x = 0;
             LOG_DEBUG("Inside searchKnn, element count: " << curElementsCount_);
             std::vector<std::pair<dist_t, idInt>> result;
@@ -280,11 +282,11 @@ namespace hnswlib {
             std::vector<std::pair<dist_t, idhInt>> top_candidates;
             LOG_DEBUG("Starting search in level 0..current object " << currObj);
             if(deletedElementsCount_) {
-                top_candidates = searchBaseLayer<false, true>(
-                        currObj, query_data, 0, std::max(ef, k));  // Level 0 for final search
+                top_candidates = searchBaseLayer<false, true, FilterFunctor>(
+                        currObj, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
             } else {
-                top_candidates = searchBaseLayer<false, false>(
-                        currObj, query_data, 0, std::max(ef, k));  // Level 0 for final search
+                top_candidates = searchBaseLayer<false, false, FilterFunctor>(
+                        currObj, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
             }
             LOG_DEBUG("Search in level 0 completed. Found " << top_candidates.size()
                                                             << " candidates");
@@ -295,6 +297,18 @@ namespace hnswlib {
                                     getExternalLabel(top_candidates[i].second));
             }
             return result;
+        }
+
+        std::vector<std::pair<dist_t, idInt>>
+        searchKnn(const void* query_data,
+                  size_t k,
+                  size_t ef = settings::DEFAULT_EF_SEARCH,
+                  BaseFilterFunctor* isIdAllowed = nullptr) const override {
+            if (isIdAllowed) {
+                 return searchKnn<BaseFilterFunctor>(query_data, k, ef, isIdAllowed);
+            } else {
+                 return searchKnn<void>(query_data, k, ef, nullptr);
+            }
         }
 
         void saveIndex(const std::string& location) override {
@@ -1060,9 +1074,9 @@ namespace hnswlib {
 
         // Search function for the base layer
         // Returns a vector of top candidates sorted by similarity (1-distance) in reverse order
-        template <bool is_insert, bool has_deletions>
+        template <bool is_insert, bool has_deletions, typename FilterFunctor = void>
         std::vector<std::pair<dist_t, idhInt>>
-        searchBaseLayer(idhInt ep_id, const void* data_point, idhInt layer, size_t ef) const {
+        searchBaseLayer(idhInt ep_id, const void* data_point, idhInt layer, size_t ef, FilterFunctor* filter = nullptr) const {
             LOG_TIME("searchBaseLayer");
             VisitedList* vl = visited_list_pool_->getFreeVisitedList();
             vl_type* visited_array = vl->mass;
@@ -1095,9 +1109,34 @@ namespace hnswlib {
                 if(vec_data) {
                     dist_t sim = curSimFunc(data_point, vec_data, curDistParam);
 
-                    top_candidates.emplace(sim, ep_id);
-                    candidate_set.emplace(sim, ep_id);
-                    lowerBound = sim;
+                    if constexpr(std::is_same_v<FilterFunctor, void>) {
+                        top_candidates.emplace(sim, ep_id);
+                        candidate_set.emplace(sim, ep_id);
+                        lowerBound = sim;
+                    } else if constexpr(std::is_same_v<FilterFunctor, BaseFilterFunctor>) {
+                         // Virtual call path
+                         bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
+                         candidate_set.emplace(sim, ep_id); // Always explore
+                         if (allowed) {
+                             top_candidates.emplace(sim, ep_id);
+                             lowerBound = sim;
+                         } else {
+                              lowerBound = std::numeric_limits<dist_t>::lowest(); 
+                              // If not allowed, we don't add to top_candidates, 
+                              // so lowerBound remains low unless we find allowed.
+                              // Actually if top_candidates is empty, lowerBound logic needs care.
+                         }
+                    } else {
+                        // Templated path
+                        bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
+                        candidate_set.emplace(sim, ep_id);
+                        if (allowed) {
+                            top_candidates.emplace(sim, ep_id);
+                            lowerBound = sim;
+                        } else {
+                             lowerBound = std::numeric_limits<dist_t>::lowest();
+                        }
+                    }
                 } else {
                     lowerBound = std::numeric_limits<dist_t>::lowest();
                     candidate_set.emplace(lowerBound, ep_id);
@@ -1168,12 +1207,21 @@ namespace hnswlib {
                         candidate_set.emplace(sim, candidate_id);
 
                         if(!has_deletions || !isMarkedDeleted(candidate_id)) {
-                            top_candidates.emplace(sim, candidate_id);
-                            if(top_candidates.size() > ef) {
-                                top_candidates.pop();
+                            bool allowed = true;
+                            if constexpr(!std::is_same_v<FilterFunctor, void>) {
+                                if (filter != nullptr) {
+                                    allowed = (*filter)(getExternalLabel(candidate_id));
+                                }
                             }
-                            if(!top_candidates.empty()) {
-                                lowerBound = top_candidates.top().first;
+                            
+                            if (allowed) {
+                                top_candidates.emplace(sim, candidate_id);
+                                if(top_candidates.size() > ef) {
+                                    top_candidates.pop();
+                                }
+                                if(!top_candidates.empty()) {
+                                    lowerBound = top_candidates.top().first;
+                                }
                             }
                         }
                     }

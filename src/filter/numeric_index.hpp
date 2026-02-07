@@ -12,15 +12,14 @@
 #include "../core/types.hpp"
 
 namespace ndd {
-    namespace numeric {
+    namespace filter {
 
-        // Sortable Key Utilities
+        // --- Sortable Key Utilities ---
         inline uint32_t float_to_sortable(float f) {
             uint32_t i;
             std::memcpy(&i, &f, sizeof(float));
-            // IEEE 754 floats:
-            // If f >= 0 (sign bit 0): map to [0x80000000, 0xFFFFFFFF]
-            // If f < 0 (sign bit 1): map to [0x00000000, 0x7FFFFFFF]
+            // IEEE 754: if sign bit set, flip all bits. Else flip just sign.
+            // This makes negatives < positives order correctly.
             uint32_t mask = (int32_t(i) >> 31) | 0x80000000;
             return i ^ mask;
         }
@@ -41,126 +40,196 @@ namespace ndd {
             return static_cast<int32_t>(i ^ 0x80000000);
         }
 
-        // Bucket Structure
+        // --- Bucket Structure (Hybrid) ---
         struct Bucket {
-            static constexpr size_t MAX_SIZE = 512;                // Increased bucket size
-            std::vector<std::pair<uint32_t, ndd::idInt>> entries;  // value, doc_id
+            static constexpr size_t MAX_SIZE = 1024;
+            static constexpr uint32_t MAX_DELTA = 65535;
 
-            // Serialize to byte buffer
-            std::vector<uint8_t> serialize() const {
-                // Format: Count(4) + [Value(4) + ID(sizeof(idInt))] * N
-                std::vector<uint8_t> buffer;
-                buffer.reserve(4 + entries.size() * (4 + sizeof(ndd::idInt)));
+            // Runtime only, not serialized in the payload
+            uint32_t base_value = 0;
 
-                uint32_t count = static_cast<uint32_t>(entries.size());
-                buffer.insert(buffer.end(), (uint8_t*)&count, (uint8_t*)&count + 4);
+            // Data
+            std::vector<uint16_t> deltas;
+            std::vector<ndd::idInt> ids;
+            ndd::RoaringBitmap summary_bitmap;
 
-                for(const auto& entry : entries) {
-                    buffer.insert(buffer.end(), (uint8_t*)&entry.first, (uint8_t*)&entry.first + 4);
-                    buffer.insert(buffer.end(),
-                                  (uint8_t*)&entry.second,
-                                  (uint8_t*)&entry.second + sizeof(ndd::idInt));
-                }
-                return buffer;
-            }
+            bool is_dirty = false;
 
-            static Bucket deserialize(const void* data, size_t len) {
-                Bucket b;
-                if(len < 4) {
-                    return b;
-                }
-
-                const uint8_t* ptr = static_cast<const uint8_t*>(data);
-                uint32_t count;
-                std::memcpy(&count, ptr, 4);
-                ptr += 4;
-
-                size_t entry_size = 4 + sizeof(ndd::idInt);
-                if(len < 4 + count * entry_size) {
-                    // Corrupt data or partial read
-                    return b;
-                }
-
-                b.entries.reserve(count);
-                for(uint32_t i = 0; i < count; ++i) {
-                    uint32_t val;
-                    ndd::idInt id;
-                    std::memcpy(&val, ptr, 4);
-                    ptr += 4;
-                    std::memcpy(&id, ptr, sizeof(ndd::idInt));
-                    ptr += sizeof(ndd::idInt);
-                    b.entries.emplace_back(val, id);
-                }
-                return b;
+            // Helper to get actual value
+            uint32_t get_value(size_t index) const {
+                return base_value + deltas[index];
             }
 
             void add(uint32_t val, ndd::idInt id) {
-                entries.emplace_back(val, id);
-                // Keep sorted by value
-                std::sort(entries.begin(), entries.end());
+                if (val < base_value) {
+                     // Should not happen if Key logic is correct
+                     throw std::runtime_error("Insert value < Base Value"); 
+                }
+                uint32_t delta_32 = val - base_value;
+                if (delta_32 > MAX_DELTA) {
+                    throw std::runtime_error("Delta overflow");
+                }
+                
+                // Maintain sorted order by Value (Delta)
+                uint16_t delta = static_cast<uint16_t>(delta_32);
+                
+                // Find insertion point
+                auto it = std::lower_bound(deltas.begin(), deltas.end(), delta);
+                size_t index = std::distance(deltas.begin(), it);
+
+                deltas.insert(it, delta);
+                ids.insert(ids.begin() + index, id);
+                
+                summary_bitmap.add(id);
+                is_dirty = true;
             }
 
             bool remove(ndd::idInt id) {
-                auto it = std::remove_if(entries.begin(), entries.end(), [id](const auto& p) {
-                    return p.second == id;
-                });
-                if(it != entries.end()) {
-                    entries.erase(it, entries.end());
-                    return true;
+                // Find index by ID (linear scan needed as ids are not sorted)
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (ids[i] == id) {
+                        ids.erase(ids.begin() + i);
+                        deltas.erase(deltas.begin() + i);
+                        
+                        // Rebuild or update bitmap? Roaring remove is fast
+                        summary_bitmap.remove(id);
+                        is_dirty = true;
+                        return true;
+                    }
                 }
                 return false;
             }
 
-            bool is_full() const { return entries.size() >= MAX_SIZE; }
-            bool is_empty() const { return entries.empty(); }
+            // Serialization Format:
+            // [BitmapSize (4)]
+            // [Bitmap Bytes]
+            // [Count (2)]
+            // [Deltas (Count * 2)]
+            // [IDs (Count * sizeof(idInt))]
+            std::vector<uint8_t> serialize() const {
+                // Optimize bitmap
+                const_cast<ndd::RoaringBitmap&>(summary_bitmap).runOptimize();
+                
+                size_t bm_size = summary_bitmap.getSizeInBytes();
+                uint16_t count = static_cast<uint16_t>(ids.size());
+                
+                size_t total_size = 4 + bm_size + 2 + (count * 2) + (count * sizeof(ndd::idInt));
+                std::vector<uint8_t> buffer(total_size);
+                uint8_t* ptr = buffer.data();
 
-            // Split bucket into two, returning the new bucket (upper half)
-            Bucket split() {
-                Bucket new_bucket;
-                size_t mid = entries.size() / 2;
+                // 1. Bitmap Header
+                uint32_t bm_size_32 = static_cast<uint32_t>(bm_size);
+                std::memcpy(ptr, &bm_size_32, 4); ptr += 4;
 
-                new_bucket.entries.assign(entries.begin() + mid, entries.end());
-                entries.resize(mid);
+                // 2. Bitmap Data
+                if (bm_size > 0) {
+                    summary_bitmap.write(reinterpret_cast<char*>(ptr));
+                    ptr += bm_size;
+                }
 
-                return new_bucket;
+                // 3. Count
+                std::memcpy(ptr, &count, 2); ptr += 2;
+
+                // 4. Deltas
+                if (count > 0) {
+                    std::memcpy(ptr, deltas.data(), count * 2); ptr += count * 2;
+                }
+
+                // 5. IDs
+                if (count > 0) {
+                    std::memcpy(ptr, ids.data(), count * sizeof(ndd::idInt)); 
+                }
+                
+                return buffer;
             }
 
-            uint32_t min_val() const { return entries.empty() ? 0 : entries.front().first; }
-            uint32_t max_val() const { return entries.empty() ? 0 : entries.back().first; }
+            static Bucket deserialize(const void* data, size_t len, uint32_t base_val) {
+                Bucket b;
+                b.base_value = base_val;
+                
+                if (len < 6) return b; // Min valid size
+
+                const uint8_t* ptr = static_cast<const uint8_t*>(data);
+                const uint8_t* end = ptr + len;
+                
+                // 1. Bitmap Size
+                uint32_t bm_size;
+                std::memcpy(&bm_size, ptr, 4); ptr += 4;
+
+                if (ptr + bm_size > end) {
+                    throw std::runtime_error("Bucket corrupt: invalid bitmap size");
+                }
+
+                // 2. Bitmap
+                if (bm_size > 0) {
+                   b.summary_bitmap = ndd::RoaringBitmap::read(reinterpret_cast<const char*>(ptr));
+                   ptr += bm_size;
+                }
+
+                if (ptr + 2 > end) throw std::runtime_error("Bucket corrupt: truncated count");
+
+                // 3. Count
+                uint16_t count;
+                std::memcpy(&count, ptr, 2); ptr += 2;
+
+                // 4. Deltas & IDs
+                if (count > 0) {
+                    size_t delta_size = count * 2;
+                    size_t id_size = count * sizeof(ndd::idInt);
+                    
+                    if (ptr + delta_size + id_size > end) {
+                         throw std::runtime_error("Bucket corrupt: truncated Data");
+                    }
+
+                    b.deltas.resize(count);
+                    std::memcpy(b.deltas.data(), ptr, delta_size); ptr += delta_size;
+
+                    b.ids.resize(count);
+                    std::memcpy(b.ids.data(), ptr, id_size); 
+                }
+                
+                return b;
+            }
+
+            // Fast access to just the bitmap (for middle buckets)
+            static ndd::RoaringBitmap read_summary_bitmap(const void* data, size_t len) {
+               const uint8_t* ptr = static_cast<const uint8_t*>(data);
+               uint32_t bm_size;
+               std::memcpy(&bm_size, ptr, 4); ptr += 4;
+               if(bm_size == 0) return ndd::RoaringBitmap();
+               return ndd::RoaringBitmap::read(reinterpret_cast<const char*>(ptr));
+            }
+
+            bool is_full() const { return ids.size() >= MAX_SIZE; }
+            bool is_empty() const { return ids.empty(); }
         };
 
         class NumericIndex {
         private:
             MDBX_env* env_;
             MDBX_dbi forward_dbi_;   // ID -> Value (Field:ID -> Value)
-            MDBX_dbi inverted_dbi_;  // BucketKey -> Bucket (Field:StartVal -> BucketBlob)
+            MDBX_dbi inverted_dbi_;  // BucketKey -> BucketBlob
 
-            // Helper to format keys
             std::string make_forward_key(const std::string& field, ndd::idInt id) {
                 return field + ":" + std::to_string(id);
             }
 
+            // Key Format: [Field]:[BigEndian_BaseValue]
             std::string make_bucket_key(const std::string& field, uint32_t start_val) {
-                // Big-endian for sorting
                 uint32_t be_val = 0;
 #if defined(__GNUC__) || defined(__clang__)
                 be_val = __builtin_bswap32(start_val);
 #else
-                // Fallback for MSVC or others
                 be_val = ((start_val >> 24) & 0xff) | ((start_val << 8) & 0xff0000)
                          | ((start_val >> 8) & 0xff00) | ((start_val << 24) & 0xff000000);
 #endif
-
                 std::string key = field + ":";
                 key.append((char*)&be_val, 4);
                 return key;
             }
 
-            // Helper to parse bucket key
             uint32_t parse_bucket_key_val(const std::string& key) {
-                if(key.size() < 4) {
-                    return 0;
-                }
+                if (key.size() < 4) return 0;
                 uint32_t be_val;
                 std::memcpy(&be_val, key.data() + key.size() - 4, 4);
 #if defined(__GNUC__) || defined(__clang__)
@@ -172,25 +241,13 @@ namespace ndd {
             }
 
         public:
-            NumericIndex(MDBX_env* env) :
-                env_(env) {
+            NumericIndex(MDBX_env* env) : env_(env) {
                 MDBX_txn* txn;
-                int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
-                if(rc != MDBX_SUCCESS) {
-                    throw std::runtime_error("Failed to begin txn for NumericIndex init");
+                if (mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn) == MDBX_SUCCESS) {
+                    mdbx_dbi_open(txn, "numeric_forward", MDBX_CREATE, &forward_dbi_);
+                    mdbx_dbi_open(txn, "numeric_inverted", MDBX_CREATE, &inverted_dbi_);
+                    mdbx_txn_commit(txn);
                 }
-
-                rc = mdbx_dbi_open(txn, "numeric_forward", MDBX_CREATE, &forward_dbi_);
-                if(rc != MDBX_SUCCESS) {
-                    throw std::runtime_error("Failed to open numeric_forward dbi");
-                }
-
-                rc = mdbx_dbi_open(txn, "numeric_inverted", MDBX_CREATE, &inverted_dbi_);
-                if(rc != MDBX_SUCCESS) {
-                    throw std::runtime_error("Failed to open numeric_inverted dbi");
-                }
-
-                mdbx_txn_commit(txn);
             }
 
             void put(const std::string& field, ndd::idInt id, uint32_t value) {
@@ -205,33 +262,6 @@ namespace ndd {
                 }
             }
 
-            void
-            put_internal(MDBX_txn* txn, const std::string& field, ndd::idInt id, uint32_t value) {
-                // 1. Check Forward Index for existing value (Update case)
-                std::string fwd_key_str = make_forward_key(field, id);
-                MDBX_val fwd_key{const_cast<char*>(fwd_key_str.data()), fwd_key_str.size()};
-                MDBX_val fwd_val;
-
-                int rc = mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val);
-                if(rc == MDBX_SUCCESS) {
-                    uint32_t old_val;
-                    std::memcpy(&old_val, fwd_val.iov_base, 4);
-                    if(old_val == value) {
-                        return;  // No change
-                    }
-
-                    // Remove from old bucket
-                    remove_from_bucket(txn, field, old_val, id);
-                }
-
-                // 2. Update Forward Index
-                MDBX_val new_val_data{&value, sizeof(uint32_t)};
-                mdbx_put(txn, forward_dbi_, &fwd_key, &new_val_data, MDBX_UPSERT);
-
-                // 3. Add to Inverted Index (Buckets)
-                add_to_bucket(txn, field, value, id);
-            }
-
             void remove(const std::string& field, ndd::idInt id) {
                 MDBX_txn* txn;
                 mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -240,17 +270,13 @@ namespace ndd {
                     MDBX_val fwd_key{const_cast<char*>(fwd_key_str.data()), fwd_key_str.size()};
                     MDBX_val fwd_val;
 
-                    int rc = mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val);
-                    if(rc == MDBX_SUCCESS) {
+                    if(mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val) == MDBX_SUCCESS) {
                         uint32_t old_val;
-                        std::memcpy(&old_val, fwd_val.iov_base, 4);
-
-                        // Remove from bucket
-                        remove_from_bucket(txn, field, old_val, id);
-
-                        // Remove from forward index
+                        std::memcpy(&old_val, fwd_val.iov_base, sizeof(uint32_t));
+                        remove_from_buckets(txn, field, old_val, id);
                         mdbx_del(txn, forward_dbi_, &fwd_key, nullptr);
                     }
+
                     mdbx_txn_commit(txn);
                 } catch(...) {
                     mdbx_txn_abort(txn);
@@ -258,346 +284,347 @@ namespace ndd {
                 }
             }
 
+        private:
+            void put_internal(MDBX_txn* txn, const std::string& field, ndd::idInt id, uint32_t value) {
+                // 1. Check Forward Index
+                std::string fwd_key_str = make_forward_key(field, id);
+                MDBX_val fwd_key{const_cast<char*>(fwd_key_str.data()), fwd_key_str.size()};
+                MDBX_val fwd_val;
+
+                if (mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val) == MDBX_SUCCESS) {
+                    uint32_t old_val;
+                    std::memcpy(&old_val, fwd_val.iov_base, 4);
+                    if (old_val == value) return;
+                    remove_from_buckets(txn, field, old_val, id);
+                }
+
+                // 2. Update Forward
+                MDBX_val new_val_data{&value, sizeof(uint32_t)};
+                mdbx_put(txn, forward_dbi_, &fwd_key, &new_val_data, MDBX_UPSERT);
+
+                // 3. Add to Inverted Buckets
+                add_to_buckets(txn, field, value, id);
+            }
+
+            void remove_from_buckets(MDBX_txn* txn, const std::string& field, uint32_t value, ndd::idInt id) {
+                // Find bucket
+                std::string bkey_str = make_bucket_key(field, value);
+                MDBX_val key{const_cast<char*>(bkey_str.data()), bkey_str.size()};
+                MDBX_val data;
+                MDBX_cursor* cursor;
+                mdbx_cursor_open(txn, inverted_dbi_, &cursor);
+
+                // Scan backward to find bucket covering 'value'
+                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+                
+                // Logic to find correct bucket:
+                std::string found_key;
+
+                if (rc == MDBX_SUCCESS) {
+                    found_key = std::string((char*)key.iov_base, key.iov_len);
+                    // Check if we are in right field & range
+                    if (found_key.rfind(field + ":", 0) != 0 || parse_bucket_key_val(found_key) > value) {
+                            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
+                    }
+                } else if (rc == MDBX_NOTFOUND) {
+                   rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
+                }
+
+                // Should be at correct bucket now
+                if (rc == MDBX_SUCCESS) {
+                     found_key = std::string((char*)key.iov_base, key.iov_len);
+                     if (found_key.rfind(field + ":", 0) == 0) {
+                         uint32_t bucket_base = parse_bucket_key_val(found_key);
+                         if (value >= bucket_base) {
+                             Bucket b = Bucket::deserialize(data.iov_base, data.iov_len, bucket_base);
+                             if (b.remove(id)) {
+                                 // Save back or Delete if empty
+                                 if (b.is_empty()) {
+                                     mdbx_cursor_del(cursor, static_cast<MDBX_put_flags_t>(0));
+                                 } else {
+                                     auto bytes = b.serialize();
+                                     MDBX_val new_data{bytes.data(), bytes.size()};
+                                     mdbx_cursor_put(cursor, &key, &new_data, MDBX_CURRENT);
+                                 }
+                             }
+                         }
+                     }
+                }
+                mdbx_cursor_close(cursor);
+            }
+
+            void add_to_buckets(MDBX_txn* txn, const std::string& field, uint32_t value, ndd::idInt id) {
+                MDBX_cursor* cursor;
+                mdbx_cursor_open(txn, inverted_dbi_, &cursor);
+
+                // Find candidate bucket
+                std::string search_key = make_bucket_key(field, value);
+                MDBX_val key{const_cast<char*>(search_key.data()), search_key.size()};
+                MDBX_val data;
+
+                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+                
+                bool create_new = false;
+                std::string target_key_str;
+                uint32_t target_base = 0;
+
+                // Move logic to find predecessor
+                if (rc == MDBX_SUCCESS) {
+                     std::string found_key((char*)key.iov_base, key.iov_len);
+                     if (found_key.rfind(field + ":", 0) != 0 || parse_bucket_key_val(found_key) > value) {
+                         rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
+                     }
+                } else {
+                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
+                }
+
+                if (rc == MDBX_SUCCESS) {
+                    std::string found_key((char*)key.iov_base, key.iov_len);
+                    if (found_key.rfind(field + ":", 0) == 0) {
+                        target_base = parse_bucket_key_val(found_key);
+                        // Check range condition
+                        if (value >= target_base && (static_cast<uint64_t>(value) - target_base) <= Bucket::MAX_DELTA) {
+                             target_key_str = found_key;
+                        } else {
+                            create_new = true;
+                        }
+                    } else {
+                        create_new = true;
+                    }
+                } else {
+                    create_new = true;
+                }
+
+                if (create_new) {
+                    // Create new bucket at exact value
+                    Bucket b;
+                    b.base_value = value;
+                    b.add(value, id);
+                    auto bytes = b.serialize();
+                    
+                    target_key_str = make_bucket_key(field, value);
+                    MDBX_val k{const_cast<char*>(target_key_str.data()), target_key_str.size()};
+                    MDBX_val v{bytes.data(), bytes.size()};
+                    mdbx_put(txn, inverted_dbi_, &k, &v, MDBX_UPSERT);
+                    
+                } else {
+                    // Update existing
+                    // We must re-fetch current key/data because cursor move might have updated key/data
+                     MDBX_val k{const_cast<char*>(target_key_str.data()), target_key_str.size()};
+                     MDBX_val v;
+                     if(mdbx_cursor_get(cursor, &k, &v, MDBX_SET) != MDBX_SUCCESS) {
+                         // Should not happen if logic is correct
+                         throw std::runtime_error("Cursor sync fail");
+                     }
+
+                    Bucket b = Bucket::deserialize(v.iov_base, v.iov_len, target_base);
+                    
+                    // Capacity Check
+                    if (b.ids.size() >= Bucket::MAX_SIZE) {
+                         // SPLIT LOGIC
+                         // Sort is maintained by arrays. 
+                         // "Slide Split": Scan right from median
+                         size_t mid_idx = b.ids.size() / 2;
+                         
+                         // Slide right if values are same (uniqueness constraint)
+                         while (mid_idx < b.deltas.size() && b.deltas[mid_idx] == b.deltas[0]) {
+                             mid_idx++;
+                         }
+                         
+                         // If we hit end, we can't split by value uniqueness
+                         if (mid_idx == b.deltas.size()) {
+                             // Fallback: Just append (overfill) or implement logic to handle identicals.
+                             // For now: Append
+                             b.add(value, id);
+                             auto bytes = b.serialize();
+                             MDBX_val k2{const_cast<char*>(target_key_str.data()), target_key_str.size()};
+                             MDBX_val v2{bytes.data(), bytes.size()};
+                             mdbx_cursor_put(cursor, &k2, &v2, MDBX_CURRENT);
+                             mdbx_cursor_close(cursor);
+                             return;
+                         }
+
+                         // Standard Slide Split
+                         Bucket right_b;
+                         right_b.base_value = b.base_value + b.deltas[mid_idx]; // New base
+                         
+                         // Move entries
+                         for(size_t i=mid_idx; i<b.deltas.size(); ++i) {
+                             right_b.add(b.base_value + b.deltas[i], b.ids[i]);
+                         }
+                         
+                         // Truncate left
+                         b.deltas.resize(mid_idx);
+                         b.ids.resize(mid_idx);
+                         // Rebuild left bitmap
+                         b.summary_bitmap = ndd::RoaringBitmap();
+                         for(auto pid : b.ids) b.summary_bitmap.add(pid);
+
+                         // Now add new value to correct bucket
+                         if (value >= right_b.base_value) {
+                             right_b.add(value, id);
+                         } else {
+                             // If value < right, goes to left. 
+                             // But wait, split point was determined by existing items.
+                             // If new value is >= base+split_delta, it goes right.
+                             // BUT we just cleared right from b.
+                             // Correct logic:
+                             b.add(value, id); // Add to left if it fits range (logic handles delta)
+                             // Oh wait, if we added to left, we might overflow again or break order? 
+                             // Simply: Check which bucket covers it.
+                             // Left covers [Base, RightBase-1]
+                             // Right covers [RightBase, ...]
+                         }
+
+                         // Save Left
+                         auto left_bytes = b.serialize();
+                         MDBX_val left_v{left_bytes.data(), left_bytes.size()};
+                         MDBX_val left_k{const_cast<char*>(target_key_str.data()), target_key_str.size()};
+                         mdbx_cursor_put(cursor, &left_k, &left_v, MDBX_CURRENT);
+
+                         // Save Right
+                         auto right_bytes = right_b.serialize();
+                         std::string right_k_str = make_bucket_key(field, right_b.base_value);
+                         MDBX_val right_k{const_cast<char*>(right_k_str.data()), right_k_str.size()};
+                         MDBX_val right_v{right_bytes.data(), right_bytes.size()};
+                         
+                         // Use put for new key
+                         mdbx_put(txn, inverted_dbi_, &right_k, &right_v, MDBX_UPSERT);
+
+                    } else {
+                        // Normal Insert
+                        b.add(value, id);
+                        auto bytes = b.serialize();
+                        MDBX_val new_data{bytes.data(), bytes.size()};
+                        
+                        // Use cursor put to update current
+                         mdbx_cursor_put(cursor, &k, &new_data, MDBX_CURRENT);
+                    }
+                }
+                mdbx_cursor_close(cursor);
+            }
+
+        public:
             ndd::RoaringBitmap range(const std::string& field, uint32_t min_val, uint32_t max_val) {
                 ndd::RoaringBitmap result;
                 MDBX_txn* txn;
-                int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-                if(rc != MDBX_SUCCESS) {
-                    return result;
+                if (mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn) != MDBX_SUCCESS) return result;
+
+                MDBX_cursor* cursor;
+                mdbx_cursor_open(txn, inverted_dbi_, &cursor);
+
+                // 1. Find Start Bucket
+                std::string start_k = make_bucket_key(field, min_val);
+                MDBX_val key{const_cast<char*>(start_k.data()), start_k.size()};
+                MDBX_val data;
+
+                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+                if (rc == MDBX_SUCCESS) {
+                    // Check if we need to back up
+                     std::string fkey((char*)key.iov_base, key.iov_len);
+                     if (fkey.rfind(field + ":", 0) != 0 || parse_bucket_key_val(fkey) > min_val) {
+                         // Check prev
+                         MDBX_val p_key = key; 
+                         MDBX_val p_data;
+                         if (mdbx_cursor_get(cursor, &p_key, &p_data, MDBX_PREV) == MDBX_SUCCESS) {
+                              std::string pkey_str((char*)p_key.iov_base, p_key.iov_len);
+                              if (pkey_str.rfind(field + ":", 0) == 0) {
+                                  // Prev is valid start
+                                  key = p_key; data = p_data;
+                                  rc = MDBX_SUCCESS;
+                              }
+                         }
+                     }
+                } else if (rc == MDBX_NOTFOUND) {
+                     rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
+                     if (rc == MDBX_SUCCESS && data.iov_len > 0) {
+                         std::string fkey((char*)key.iov_base, key.iov_len);
+                         if (fkey.rfind(field + ":", 0) == 0) {
+                             rc = MDBX_SUCCESS;
+                         } else {
+                             rc = MDBX_NOTFOUND;
+                         }
+                     } else {
+                         rc = MDBX_NOTFOUND;
+                     }
                 }
 
-                try {
-                    MDBX_cursor* cursor;
-                    mdbx_cursor_open(txn, inverted_dbi_, &cursor);
+                // Iterate forward
+                while (rc == MDBX_SUCCESS) {
+                    std::string cur_key((char*)key.iov_base, key.iov_len);
+                    if (cur_key.rfind(field + ":", 0) != 0) break; // End of field
 
-                    // 1. Find start bucket (bucket with start_val <= min_val)
-                    std::string start_key_str = make_bucket_key(field, min_val);
-                    MDBX_val key{const_cast<char*>(start_key_str.data()), start_key_str.size()};
-                    MDBX_val data;
+                    uint32_t bucket_base = parse_bucket_key_val(cur_key);
+                    
+                    if (bucket_base > max_val) break; // Past the end
 
-                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
-
-                    bool valid_start = false;
-
-                    if(rc == MDBX_SUCCESS) {
-                        std::string found_key((char*)key.iov_base, key.iov_len);
-                        if(found_key.rfind(field + ":", 0) == 0) {
-                            // Found a bucket in the same field
-                            if(found_key > start_key_str) {
-                                // We landed on a bucket starting AFTER min_val.
-                                // Check previous bucket to see if it covers min_val.
-                                MDBX_val p_key = key;
-                                MDBX_val p_data;
-                                int p_rc = mdbx_cursor_get(cursor, &p_key, &p_data, MDBX_PREV);
-
-                                if(p_rc == MDBX_SUCCESS) {
-                                    std::string prev_key((char*)p_key.iov_base, p_key.iov_len);
-                                    if(prev_key.rfind(field + ":", 0) == 0) {
-                                        // Previous bucket is in same field, start there
-                                        valid_start = true;
-                                        // cursor is already at prev
-                                        key = p_key;
-                                        data = p_data;
-                                    } else {
-                                        // Previous bucket is different field.
-                                        // This means min_val is before the first bucket of this
-                                        // field. So we start at the found_key (first bucket). Reset
-                                        // cursor to found_key
-                                        mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
-                                        valid_start = true;
-                                    }
-                                } else {
-                                    // No prev, start at found_key
-                                    mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
-                                    valid_start = true;
-                                }
-                            } else {
-                                // Exact match on start key
-                                valid_start = true;
-                            }
-                        } else {
-                            // Found key is next field. Go back to see if we have buckets for this
-                            // field.
-                            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
-                            if(rc == MDBX_SUCCESS) {
-                                std::string prev_key((char*)key.iov_base, key.iov_len);
-                                if(prev_key.rfind(field + ":", 0) == 0) {
-                                    valid_start = true;
-                                }
-                            }
-                        }
-                    } else if(rc == MDBX_NOTFOUND) {
-                        // Try last bucket
-                        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
-                        if(rc == MDBX_SUCCESS) {
-                            std::string last_key((char*)key.iov_base, key.iov_len);
-                            if(last_key.rfind(field + ":", 0) == 0) {
-                                valid_start = true;
-                            }
-                        }
+                    // Peek Strategy:
+                    // If bucket_base >= min_val, we know the start is covered.
+                    // If we could know NEXT bucket start, we'd know overlap.
+                    // Since we iterate, we can be greedy on read.
+                    
+                    // For now, always deserialize. 
+                    // Potential optimization: Read only bitmap if we are "deep" in the range. 
+                    // e.g. min_val=10, max_val=100. Bucket=20.
+                    // If bucket=20. Next Bucket=30.
+                    // Then Bucket 20 covers [20..30).
+                    // Range [10..100] covers [20..30] fully.
+                    // So we need lookahead. 
+                    
+                    // Simple logic without lookahead:
+                    // Just read full bucket. It's 8KB max (2 pages). 
+                    // It's fast unless we have millions of buckets.
+                    
+                    Bucket b = Bucket::deserialize(data.iov_base, data.iov_len, bucket_base);
+                    
+                    if (b.ids.empty()) {
+                        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+                        continue;
                     }
 
-                    if(valid_start) {
-                        // Iterate buckets
-                        while(true) {
-                            std::string curr_key((char*)key.iov_base, key.iov_len);
-                            if(curr_key.rfind(field + ":", 0) != 0) {
-                                break;  // End of field
-                            }
+                    uint32_t b_min = b.get_value(0);
+                    uint32_t b_max = b.get_value(b.ids.size()-1);
 
-                            uint32_t bucket_start = parse_bucket_key_val(curr_key);
-                            if(bucket_start > max_val) {
-                                break;  // Bucket starts after range
-                            }
-
-                            // Deserialize and scan
-                            Bucket bucket = Bucket::deserialize(data.iov_base, data.iov_len);
-                            for(const auto& entry : bucket.entries) {
-                                if(entry.first >= min_val && entry.first <= max_val) {
-                                    result.add(entry.second);
-                                }
-                            }
-
-                            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
-                            if(rc != MDBX_SUCCESS) {
-                                break;
-                            }
-                        }
+                    if (b_min >= min_val && b_max <= max_val) {
+                         // Full overlap
+                         result |= b.summary_bitmap;
+                    } else {
+                        // Partial overlap
+                         for(size_t i=0; i<b.ids.size(); ++i) {
+                             uint32_t v = b.get_value(i);
+                             if (v >= min_val && v <= max_val) {
+                                 result.add(b.ids[i]);
+                             }
+                         }
                     }
 
-                    mdbx_cursor_close(cursor);
-                    mdbx_txn_abort(txn);  // Read-only
-                } catch(...) {
-                    mdbx_txn_abort(txn);
-                    throw;
+                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
                 }
+
+                mdbx_cursor_close(cursor);
+                mdbx_txn_abort(txn);
                 return result;
             }
 
-            // Check if ID has value in range [min_val, max_val] using Forward Index
-            bool check_range(const std::string& field,
-                             ndd::idInt id,
-                             uint32_t min_val,
-                             uint32_t max_val) {
+            bool check_range(const std::string& field, ndd::idInt id, uint32_t min_val, uint32_t max_val) {
                 MDBX_txn* txn;
-                int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-                if(rc != MDBX_SUCCESS) {
-                    return false;
+                if(mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn) != MDBX_SUCCESS) return false;
+                
+                std::string fwd_key_str = make_forward_key(field, id);
+                MDBX_val fwd_key{const_cast<char*>(fwd_key_str.data()), fwd_key_str.size()};
+                MDBX_val fwd_val;
+                
+                bool match = false;
+                if(mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val) == MDBX_SUCCESS) {
+                    uint32_t val;
+                    std::memcpy(&val, fwd_val.iov_base, 4);
+                    if(val >= min_val && val <= max_val) match = true;
                 }
-
-                try {
-                    std::string fwd_key_str = make_forward_key(field, id);
-                    MDBX_val fwd_key{const_cast<char*>(fwd_key_str.data()), fwd_key_str.size()};
-                    MDBX_val fwd_val;
-
-                    rc = mdbx_get(txn, forward_dbi_, &fwd_key, &fwd_val);
-                    bool match = false;
-                    if(rc == MDBX_SUCCESS) {
-                        uint32_t val;
-                        std::memcpy(&val, fwd_val.iov_base, 4);
-                        if(val >= min_val && val <= max_val) {
-                            match = true;
-                        }
-                    }
-                    mdbx_txn_abort(txn);
-                    return match;
-                } catch(...) {
-                    mdbx_txn_abort(txn);
-                    throw;
-                }
-            }
-
-        private:
-            void
-            add_to_bucket(MDBX_txn* txn, const std::string& field, uint32_t value, ndd::idInt id) {
-                // Find the bucket that starts <= value
-                // We search for key = field:value. If exact match, good.
-                // If not, we go to the previous key (MDBX_SET_RANGE returns >=, so we might need
-                // prev)
-
-                std::string target_key = make_bucket_key(field, value);
-                MDBX_val key{const_cast<char*>(target_key.data()), target_key.size()};
-                MDBX_val data;
-                MDBX_cursor* cursor;
-                mdbx_cursor_open(txn, inverted_dbi_, &cursor);
-
-                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
-
-                bool found_bucket = false;
-                std::string bucket_key_str;
-
-                if(rc == MDBX_SUCCESS) {
-                    // We found a key >= target.
-                    // Check if it belongs to the same field
-                    std::string found_key((char*)key.iov_base, key.iov_len);
-                    if(found_key.rfind(field + ":", 0) == 0) {
-                        // Same field.
-                        // If found_key > target_key, we might need the PREVIOUS bucket
-                        // unless this is the very first bucket and value < found_key's start
-                        // (shouldn't happen if we maintain logic) Actually, we want the bucket
-                        // where start_val <= value.
-
-                        if(found_key > target_key) {
-                            // Go back one
-                            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
-                            if(rc == MDBX_SUCCESS) {
-                                std::string prev_key((char*)key.iov_base, key.iov_len);
-                                if(prev_key.rfind(field + ":", 0) == 0) {
-                                    // Found valid previous bucket
-                                    bucket_key_str = prev_key;
-                                    found_bucket = true;
-                                }
-                            }
-                        } else {
-                            // Exact match
-                            bucket_key_str = found_key;
-                            found_bucket = true;
-                        }
-                    } else {
-                        // Found key is for next field, go back
-                        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
-                        if(rc == MDBX_SUCCESS) {
-                            std::string prev_key((char*)key.iov_base, key.iov_len);
-                            if(prev_key.rfind(field + ":", 0) == 0) {
-                                bucket_key_str = prev_key;
-                                found_bucket = true;
-                            }
-                        }
-                    }
-                } else if(rc == MDBX_NOTFOUND) {
-                    // No key >= target. Try last key.
-                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
-                    if(rc == MDBX_SUCCESS) {
-                        std::string last_key((char*)key.iov_base, key.iov_len);
-                        if(last_key.rfind(field + ":", 0) == 0) {
-                            bucket_key_str = last_key;
-                            found_bucket = true;
-                        }
-                    }
-                }
-
-                Bucket bucket;
-                if(found_bucket) {
-                    // Load existing bucket
-                    // Note: cursor is already at the key if we didn't move it?
-                    // Actually we moved it around. Let's just get by key to be safe/simple
-                    MDBX_val b_key{const_cast<char*>(bucket_key_str.data()), bucket_key_str.size()};
-                    mdbx_get(txn, inverted_dbi_, &b_key, &data);
-                    bucket = Bucket::deserialize(data.iov_base, data.iov_len);
-                } else {
-                    // No bucket exists for this field yet. Create new one starting at 'value'
-                    // Actually, let's start at 0 or min possible?
-                    // Better: Start at 'value' for the first bucket.
-                    bucket_key_str = make_bucket_key(field, value);
-                }
-
-                bucket.add(value, id);
-
-                if(bucket.is_full()) {
-                    // Split!
-                    Bucket new_bucket = bucket.split();
-                    uint32_t new_start = new_bucket.min_val();
-
-                    // Save old bucket
-                    auto bytes = bucket.serialize();
-                    MDBX_val b_key{const_cast<char*>(bucket_key_str.data()), bucket_key_str.size()};
-                    MDBX_val b_val{bytes.data(), bytes.size()};
-                    mdbx_put(txn, inverted_dbi_, &b_key, &b_val, MDBX_put_flags_t(0));
-
-                    // Save new bucket
-                    std::string new_key_str = make_bucket_key(field, new_start);
-                    auto new_bytes = new_bucket.serialize();
-                    MDBX_val nb_key{const_cast<char*>(new_key_str.data()), new_key_str.size()};
-                    MDBX_val nb_val{new_bytes.data(), new_bytes.size()};
-                    mdbx_put(txn, inverted_dbi_, &nb_key, &nb_val, MDBX_put_flags_t(0));
-
-                } else {
-                    // Just save
-                    auto bytes = bucket.serialize();
-                    MDBX_val b_key{const_cast<char*>(bucket_key_str.data()), bucket_key_str.size()};
-                    MDBX_val b_val{bytes.data(), bytes.size()};
-                    mdbx_put(txn, inverted_dbi_, &b_key, &b_val, MDBX_put_flags_t(0));
-                }
-
-                mdbx_cursor_close(cursor);
-            }
-
-            void remove_from_bucket(MDBX_txn* txn,
-                                    const std::string& field,
-                                    uint32_t value,
-                                    ndd::idInt id) {
-                // Find bucket
-                std::string target_key = make_bucket_key(field, value);
-                MDBX_val key{const_cast<char*>(target_key.data()), target_key.size()};
-                MDBX_val data;
-                MDBX_cursor* cursor;
-                mdbx_cursor_open(txn, inverted_dbi_, &cursor);
-
-                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
-
-                std::string bucket_key_str;
-                bool found = false;
-
-                // Same logic as add_to_bucket to find the correct bucket
-                if(rc == MDBX_SUCCESS) {
-                    std::string found_key((char*)key.iov_base, key.iov_len);
-                    if(found_key.rfind(field + ":", 0) == 0) {
-                        if(found_key > target_key) {
-                            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
-                            if(rc == MDBX_SUCCESS) {
-                                std::string prev_key((char*)key.iov_base, key.iov_len);
-                                if(prev_key.rfind(field + ":", 0) == 0) {
-                                    bucket_key_str = prev_key;
-                                    found = true;
-                                }
-                            }
-                        } else {
-                            bucket_key_str = found_key;
-                            found = true;
-                        }
-                    } else {
-                        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_PREV);
-                        if(rc == MDBX_SUCCESS) {
-                            std::string prev_key((char*)key.iov_base, key.iov_len);
-                            if(prev_key.rfind(field + ":", 0) == 0) {
-                                bucket_key_str = prev_key;
-                                found = true;
-                            }
-                        }
-                    }
-                } else if(rc == MDBX_NOTFOUND) {
-                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_LAST);
-                    if(rc == MDBX_SUCCESS) {
-                        std::string last_key((char*)key.iov_base, key.iov_len);
-                        if(last_key.rfind(field + ":", 0) == 0) {
-                            bucket_key_str = last_key;
-                            found = true;
-                        }
-                    }
-                }
-
-                if(found) {
-                    // Reload data to be sure
-                    MDBX_val b_key{const_cast<char*>(bucket_key_str.data()), bucket_key_str.size()};
-                    mdbx_get(txn, inverted_dbi_, &b_key, &data);
-
-                    Bucket bucket = Bucket::deserialize(data.iov_base, data.iov_len);
-                    if(bucket.remove(id)) {
-                        if(bucket.is_empty()) {
-                            // Delete bucket
-                            mdbx_del(txn, inverted_dbi_, &b_key, nullptr);
-                        } else {
-                            // Save updated bucket
-                            auto bytes = bucket.serialize();
-                            MDBX_val b_val{bytes.data(), bytes.size()};
-                            mdbx_put(txn, inverted_dbi_, &b_key, &b_val, MDBX_put_flags_t(0));
-                        }
-                    }
-                }
-
-                mdbx_cursor_close(cursor);
+                
+                mdbx_txn_abort(txn);
+                return match;
             }
         };
 
-    }  // namespace numeric
-}  // namespace ndd
+    } // namespace filter
+} // namespace ndd

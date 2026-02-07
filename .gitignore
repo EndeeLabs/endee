@@ -8,6 +8,13 @@ build/*
 
 # Ignore tests build directory
 tests/build/
+tests/build*/
+
+# Test binaries
+tests/**/ndd_filter_test
+
+# macOS debug symbols
+*.dSYM/
 
 # Sometimes data files are created for tetsing
 data/

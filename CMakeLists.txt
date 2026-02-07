@@ -311,9 +311,16 @@ target_link_libraries(${NDD_BINARY_NAME} PRIVATE
 # Installation rules
 install(TARGETS ${NDD_BINARY_NAME} RUNTIME DESTINATION bin)
 
-# Print configuration info
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "Debug mode: ${DEBUG}")
+
+# =======================
+# Testing
+# =======================
+option(ENABLE_TESTING "Enable building tests" OFF)
+if(ENABLE_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 message(STATUS "Processor: ${CMAKE_SYSTEM_PROCESSOR}")
 if(USE_AVX512)
     message(STATUS "SIMD Mode: AVX512")

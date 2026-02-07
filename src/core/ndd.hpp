@@ -1519,6 +1519,12 @@ public:
             auto& entry = getIndexEntry(index_id);
             entry.searchCount += k;
 
+            // 0. Compute Filter Bitmap (Shared)
+            std::optional<ndd::RoaringBitmap> active_filter_bitmap;
+            if (!filter_array.empty()) {
+                 active_filter_bitmap = entry.vector_storage->filter_store_->computeFilterBitmap(filter_array);
+            }
+
             // 1. Sparse Search (Async)
             std::future<std::vector<std::pair<ndd::idInt, float>>> sparse_future;
             if(entry.sparse_storage && !sparse_indices.empty()) {
@@ -1554,11 +1560,52 @@ public:
                 auto space = entry.alg->getSpace();
                 std::vector<uint8_t> query_bytes =
                         ndd::quant::get_quantizer_dispatch(quant_level).quantize(query);
-                // Always try post-filtering first (or direct search if no filter)
-                // When there are filters, we need to search for more candidates to account for
-                // filtering
-                size_t search_k = filter_array.empty() ? k : std::max(ef, k * 2);
-                dense_results = entry.alg->searchKnn(query_bytes.data(), search_k, ef);
+
+                if (!active_filter_bitmap) {
+                     dense_results = entry.alg->searchKnn(query_bytes.data(), k, ef);
+                } else {
+                    // Smart Filter Execution Strategy
+                    auto& bitmap = *active_filter_bitmap;
+                    size_t card = bitmap.cardinality();
+
+                    if (card == 0) {
+                        // No results match filter
+                    } else if (card < settings::PREFILTER_CARDINALITY_THRESHOLD) {
+                         // Strategy A: Brute Force on Small Subset
+                         std::vector<ndd::idInt> valid_ids;
+                         valid_ids.reserve(card);
+                         bitmap.iterate([](ndd::idInt id, void* ptr){
+                            static_cast<std::vector<ndd::idInt>*>(ptr)->push_back(id);
+                            return true;
+                         }, &valid_ids);
+
+                         // Fetch vectors
+                         auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
+                         
+                         // Prepare subset for bruteforce search
+                         std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
+                         vector_subset.reserve(vector_batch.size());
+                         for(const auto& [nid, vbytes] : vector_batch) {
+                             vector_subset.emplace_back(nid, vbytes);
+                         }
+                         
+                         dense_results = hnswlib::searchKnnSubset<float>(
+                             query_bytes.data(), vector_subset, k, space);
+                         
+                    } else {
+                        // Strategy B: Filtered HNSW Search
+                        BitMapFilterFunctor functor(bitmap);
+                        size_t effective_ef = ef > 0 ? ef : settings::DEFAULT_EF_SEARCH;
+
+                        // Try to use optimized templated search if algorithm matches
+                        auto* hnsw_alg = dynamic_cast<hnswlib::HierarchicalNSW<float>*>(entry.alg.get());
+                        if (hnsw_alg) {
+                             dense_results = hnsw_alg->searchKnn(query_bytes.data(), k, effective_ef, &functor);
+                        } else {
+                             dense_results = entry.alg->searchKnn(query_bytes.data(), k, effective_ef, &functor);
+                        }
+                    }
+                }
             }
 
             // 3. Get Sparse Results (Join)
@@ -1618,8 +1665,7 @@ public:
                 ndd::VectorMeta meta = entry.vector_storage->get_meta(p.second);
 
                 // Apply filter
-                if(!filter_array.empty()
-                   && !entry.vector_storage->matches_filter(p.second, meta, filter_array)) {
+                if(active_filter_bitmap && !active_filter_bitmap->contains(p.second)) {
                     continue;
                 }
 
@@ -1651,11 +1697,8 @@ public:
                 }
             }
 
-            // Check if post-filtering gave poor results and pre-filtering might help
-            // Only for dense search for now as sparse pre-filtering is not implemented
-            if(!filter_array.empty()
-               && filtered_count < k * settings::PREFILTER_RESULT_RATIO_THRESHOLD && !query.empty()
-               && sparse_results.empty()) {
+            // Fallback logic removed
+            if(false) {
                 size_t filter_cardinality =
                         entry.vector_storage->filter_store_->countIdsMatchingFilter(filter_array);
                 LOG_DEBUG("Post-filter gave poor results ("

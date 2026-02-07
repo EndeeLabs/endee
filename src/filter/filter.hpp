@@ -16,9 +16,10 @@
 #include "mdbx/mdbx.h"
 #include "../utils/log.hpp"
 #include "../core/types.hpp"
+#include "../hnsw/hnswlib.h" // For BaseFilterFunctor
 
 #include "numeric_index.hpp"
-#include "bitmap_index.hpp"
+#include "category_index.hpp"
 
 enum class FieldType : uint8_t {
     Unknown = 0,
@@ -27,13 +28,23 @@ enum class FieldType : uint8_t {
     Bool = 4
 };
 
+// Filter Functor for HNSW
+class BitMapFilterFunctor : public hnswlib::BaseFilterFunctor {
+    const ndd::RoaringBitmap& bitmap_;
+public:
+    BitMapFilterFunctor(const ndd::RoaringBitmap& bitmap) : bitmap_(bitmap) {}
+    bool operator()(ndd::idInt id) override {
+        return bitmap_.contains(id);
+    }
+};
+
 class Filter {
 private:
     MDBX_env* env_;
     MDBX_dbi dbi_;  // Used for schema storage
     std::string path_;
-    std::unique_ptr<ndd::numeric::NumericIndex> numeric_index_;
-    std::unique_ptr<ndd::filter::BitmapIndex> bitmap_index_;
+    std::unique_ptr<ndd::filter::NumericIndex> numeric_index_;
+    std::unique_ptr<ndd::filter::CategoryIndex> category_index_;
 
     static constexpr const char* SCHEMA_KEY = "__ndd_schema_v1__";
     std::unordered_map<std::string, FieldType> schema_cache_;
@@ -146,8 +157,8 @@ private:
         }
 
         // Initialize Indices
-        numeric_index_ = std::make_unique<ndd::numeric::NumericIndex>(env_);
-        bitmap_index_ = std::make_unique<ndd::filter::BitmapIndex>(env_);
+        numeric_index_ = std::make_unique<ndd::filter::NumericIndex>(env_);
+        category_index_ = std::make_unique<ndd::filter::CategoryIndex>(env_);
 
         load_schema();
     }
@@ -179,8 +190,8 @@ public:
             return ndd::RoaringBitmap();
         }
 
-        ndd::RoaringBitmap final_result;
-        bool first = true;
+        std::vector<ndd::RoaringBitmap> partial_results;
+        partial_results.reserve(filter_array.size());
 
         for(const auto& condition : filter_array) {
             if(!condition.is_object() || condition.size() != 1) {
@@ -217,9 +228,9 @@ public:
                 if(type == FieldType::Number) {
                     uint32_t sortable_val;
                     if(val.is_number_integer()) {
-                        sortable_val = ndd::numeric::int_to_sortable(val.get<int>());
+                        sortable_val = ndd::filter::int_to_sortable(val.get<int>());
                     } else if(val.is_number()) {
-                        sortable_val = ndd::numeric::float_to_sortable(val.get<float>());
+                        sortable_val = ndd::filter::float_to_sortable(val.get<float>());
                     } else {
                         throw std::runtime_error("$eq value for numeric field must be a number");
                     }
@@ -232,13 +243,13 @@ public:
                     if(val.is_string()) {
                         str_val = val.get<std::string>();
                     } else if(val.is_boolean()) {
-                        str_val = val.get<bool>() ? "true" : "false";
+                        str_val = val.get<bool>() ? "1" : "0";
                     } else {
-                        // Integers for non-numeric fields are treated as strings without padding
                         str_val = std::to_string(val.get<int>());
+                        if (str_val.size() > 255) throw std::runtime_error("Category value too long");
                     }
                     std::string key = format_filter_key(field, str_val);
-                    or_result = bitmap_index_->get_bitmap_by_key(key);
+                    or_result = category_index_->get_bitmap_by_key(key);
                 }
             } else if(op == "$in") {
                 if(!val.is_array()) {
@@ -251,9 +262,9 @@ public:
                         if(type == FieldType::Number) {
                             uint32_t sortable_val;
                             if(v.is_number_integer()) {
-                                sortable_val = ndd::numeric::int_to_sortable(v.get<int>());
+                                sortable_val = ndd::filter::int_to_sortable(v.get<int>());
                             } else if(v.is_number()) {
-                                sortable_val = ndd::numeric::float_to_sortable(v.get<float>());
+                                sortable_val = ndd::filter::float_to_sortable(v.get<float>());
                             } else {
                                 throw std::runtime_error(
                                         "$in value for numeric field must be a number");
@@ -268,13 +279,14 @@ public:
                             if(v.is_string()) {
                                 str_val = v.get<std::string>();
                             } else if(v.is_boolean()) {
-                                str_val = v.get<bool>() ? "true" : "false";
+                                str_val = v.get<bool>() ? "1" : "0";
                             } else {
                                 str_val = std::to_string(v.get<int>());
                             }
                             if(!str_val.empty()) {
+                                if (str_val.size() > 255) throw std::runtime_error("Category value too long");
                                 std::string key = format_filter_key(field, str_val);
-                                or_result |= bitmap_index_->get_bitmap_by_key(key);
+                                or_result |= category_index_->get_bitmap_by_key(key);
                             }
                         }
                     }
@@ -289,17 +301,17 @@ public:
                     uint32_t start_val, end_val;
 
                     if(val[0].is_number_integer()) {
-                        start_val = ndd::numeric::int_to_sortable(val[0].get<int>());
+                        start_val = ndd::filter::int_to_sortable(val[0].get<int>());
                     } else if(val[0].is_number()) {
-                        start_val = ndd::numeric::float_to_sortable(val[0].get<float>());
+                        start_val = ndd::filter::float_to_sortable(val[0].get<float>());
                     } else {
                         throw std::runtime_error("Range start must be a number");
                     }
 
                     if(val[1].is_number_integer()) {
-                        end_val = ndd::numeric::int_to_sortable(val[1].get<int>());
+                        end_val = ndd::filter::int_to_sortable(val[1].get<int>());
                     } else if(val[1].is_number()) {
-                        end_val = ndd::numeric::float_to_sortable(val[1].get<float>());
+                        end_val = ndd::filter::float_to_sortable(val[1].get<float>());
                     } else {
                         throw std::runtime_error("Range end must be a number");
                     }
@@ -316,14 +328,23 @@ public:
             } else {
                 throw std::runtime_error("Unsupported operator: " + op);
             }
+            
+            partial_results.push_back(std::move(or_result));
+        }
 
-            // Combine with final result
-            if(first) {
-                final_result = std::move(or_result);
-                first = false;
-            } else {
-                final_result &= or_result;
-            }
+        // Optimization: Sort by cardinality (smallest first)
+        std::sort(partial_results.begin(), partial_results.end(), 
+                 [](const ndd::RoaringBitmap& a, const ndd::RoaringBitmap& b) {
+                     return a.cardinality() < b.cardinality();
+                 });
+
+        if (partial_results.empty()) return ndd::RoaringBitmap();
+
+        ndd::RoaringBitmap final_result = partial_results[0];
+        for(size_t i = 1; i < partial_results.size(); ++i) {
+            final_result &= partial_results[i];
+            // If result becomes empty, stop early
+            if(final_result.isEmpty()) return final_result;
         }
 
         return final_result;
@@ -349,7 +370,7 @@ public:
     }
 
     void add_to_filter(const std::string& field, const std::string& value, ndd::idInt numeric_id) {
-        bitmap_index_->add(field, value, numeric_id);
+        category_index_->add(field, value, numeric_id);
     }
 
     // Batch add operation for filters
@@ -358,7 +379,7 @@ public:
         if(numeric_ids.empty()) {
             return;
         }
-        bitmap_index_->add_batch_by_key(filter_key, numeric_ids);
+        category_index_->add_batch_by_key(filter_key, numeric_ids);
     }
 
     // Optimized version to process filter JSON in batch
@@ -402,14 +423,14 @@ public:
                         // Use Numeric Index for numbers
                         uint32_t sortable_val;
                         if(value.is_number_integer()) {
-                            sortable_val = ndd::numeric::int_to_sortable(value.get<int>());
+                            sortable_val = ndd::filter::int_to_sortable(value.get<int>());
                         } else {
-                            sortable_val = ndd::numeric::float_to_sortable(value.get<float>());
+                            sortable_val = ndd::filter::float_to_sortable(value.get<float>());
                         }
                         numeric_index_->put(field, numeric_id, sortable_val);
                     } else if(value.is_boolean()) {
                         std::string filter_key =
-                                format_filter_key(field, value.get<bool>() ? "true" : "false");
+                                format_filter_key(field, value.get<bool>() ? "1" : "0");
                         filter_to_ids[filter_key].push_back(numeric_id);
                     } else {
                         // Optional: catch bad types (bool, float, object, array, etc.)
@@ -430,11 +451,11 @@ public:
 
     void
     remove_from_filter(const std::string& field, const std::string& value, ndd::idInt numeric_id) {
-        bitmap_index_->remove(field, value, numeric_id);
+        category_index_->remove(field, value, numeric_id);
     }
 
     bool contains(const std::string& field, const std::string& value, ndd::idInt numeric_id) const {
-        return bitmap_index_->contains(field, value, numeric_id);
+        return category_index_->contains(field, value, numeric_id);
     }
 
     void add_filters_from_json(ndd::idInt numeric_id, const std::string& filter_json) {
@@ -465,13 +486,13 @@ public:
                 } else if(value.is_number()) {
                     uint32_t sortable_val;
                     if(value.is_number_integer()) {
-                        sortable_val = ndd::numeric::int_to_sortable(value.get<int>());
+                        sortable_val = ndd::filter::int_to_sortable(value.get<int>());
                     } else {
-                        sortable_val = ndd::numeric::float_to_sortable(value.get<float>());
+                        sortable_val = ndd::filter::float_to_sortable(value.get<float>());
                     }
                     numeric_index_->put(field, numeric_id, sortable_val);
                 } else if(value.is_boolean()) {
-                    add_to_filter(field, value.get<bool>() ? "true" : "false", numeric_id);
+                    add_to_filter(field, value.get<bool>() ? "1" : "0", numeric_id);
                 }
             }
         } catch(const std::exception& e) {
@@ -489,7 +510,7 @@ public:
                     // Remove from Numeric Index
                     numeric_index_->remove(field, numeric_id);
                 } else if(value.is_boolean()) {
-                    remove_from_filter(field, value.get<bool>() ? "true" : "false", numeric_id);
+                    remove_from_filter(field, value.get<bool>() ? "1" : "0", numeric_id);
                 }
             }
         } catch(const std::exception& e) {
@@ -504,10 +525,10 @@ public:
         bool first = true;
         for(const auto& [field, value] : filters) {
             if(first) {
-                result = bitmap_index_->get_bitmap(field, value);
+                result = category_index_->get_bitmap(field, value);
                 first = false;
             } else {
-                result &= bitmap_index_->get_bitmap(field, value);
+                result &= category_index_->get_bitmap(field, value);
             }
         }
         return result;
@@ -518,7 +539,7 @@ public:
     combine_filters_or(const std::vector<std::pair<std::string, std::string>>& filters) const {
         ndd::RoaringBitmap result;
         for(const auto& [field, value] : filters) {
-            result |= bitmap_index_->get_bitmap(field, value);
+            result |= category_index_->get_bitmap(field, value);
         }
         return result;
     }
@@ -531,9 +552,9 @@ public:
         if(op == "$eq") {
             uint32_t sortable_val;
             if(val.is_number_integer()) {
-                sortable_val = ndd::numeric::int_to_sortable(val.get<int>());
+                sortable_val = ndd::filter::int_to_sortable(val.get<int>());
             } else if(val.is_number()) {
-                sortable_val = ndd::numeric::float_to_sortable(val.get<float>());
+                sortable_val = ndd::filter::float_to_sortable(val.get<float>());
             } else {
                 return false;
             }
@@ -545,9 +566,9 @@ public:
             for(const auto& v : val) {
                 uint32_t sortable_val;
                 if(v.is_number_integer()) {
-                    sortable_val = ndd::numeric::int_to_sortable(v.get<int>());
+                    sortable_val = ndd::filter::int_to_sortable(v.get<int>());
                 } else if(v.is_number()) {
-                    sortable_val = ndd::numeric::float_to_sortable(v.get<float>());
+                    sortable_val = ndd::filter::float_to_sortable(v.get<float>());
                 } else {
                     continue;
                 }
@@ -564,17 +585,17 @@ public:
             uint32_t start_val, end_val;
 
             if(val[0].is_number_integer()) {
-                start_val = ndd::numeric::int_to_sortable(val[0].get<int>());
+                start_val = ndd::filter::int_to_sortable(val[0].get<int>());
             } else if(val[0].is_number()) {
-                start_val = ndd::numeric::float_to_sortable(val[0].get<float>());
+                start_val = ndd::filter::float_to_sortable(val[0].get<float>());
             } else {
                 return false;
             }
 
             if(val[1].is_number_integer()) {
-                end_val = ndd::numeric::int_to_sortable(val[1].get<int>());
+                end_val = ndd::filter::int_to_sortable(val[1].get<int>());
             } else if(val[1].is_number()) {
-                end_val = ndd::numeric::float_to_sortable(val[1].get<float>());
+                end_val = ndd::filter::float_to_sortable(val[1].get<float>());
             } else {
                 return false;
             }
