@@ -410,11 +410,16 @@ int main(int argc, char** argv) {
 
                 try {
                     std::pair<bool, std::string> result =
-                            index_manager.createBackup(index_id, backup_name);
+                            index_manager.createBackupAsync(index_id, backup_name);
                     if(!result.first) {
                         return json_error(400, result.second);
                     }
-                    return crow::response(201, "Backup created successfully");
+
+                    // Return 202 Accepted with job_id
+                    crow::json::wvalue response;
+                    response["job_id"] = result.second;
+                    response["status"] = "in_progress";
+                    return crow::response(202, response.dump());
                 } catch(const std::exception& e) {
                     return json_error(500, e.what());
                 }
@@ -488,19 +493,22 @@ int main(int argc, char** argv) {
                                                           const std::string& backup_name) {
                 auto& ctx = app.get_context<AuthMiddleware>(req);
                 try {
-                    std::string backup_tar =
-                            settings::DATA_DIR + "/backups/" + backup_name + ".tar.gz";
-                    if(!std::filesystem::exists(backup_tar)) {
+                    std::string backup_file =
+                            settings::DATA_DIR + "/backups/" + backup_name + ".tar";
+
+                    if(!std::filesystem::exists(backup_file)) {
                         return json_error(404, "Backup not found");
                     }
-                    std::string file_content = read_file(backup_tar);
+
+                    std::string file_content = read_file(backup_file);
                     if(file_content.empty()) {
                         return json_error(500, "Failed to read backup file");
                     }
+
                     crow::response response;
-                    response.set_header("Content-Type", "application/gzip");
+                    response.set_header("Content-Type", "application/x-tar");
                     response.set_header("Content-Disposition",
-                                        "attachment; filename=\"" + backup_name + ".tar.gz\"");
+                                        "attachment; filename=\"" + backup_name + ".tar\"");
                     response.set_header("Content-Length", std::to_string(file_content.size()));
                     response.set_header("Cache-Control", "no-cache");
                     response.body = std::move(file_content);
@@ -533,11 +541,11 @@ int main(int argc, char** argv) {
                             // Get filename from Content-Disposition
                             if(content_disposition.params.count("filename")) {
                                 backup_name = content_disposition.params.at("filename");
-                                // check if backup name ends with .tar.gz
-                                if(backup_name.ends_with(".tar.gz")) {
-                                    backup_name = backup_name.substr(0, backup_name.size() - 7);
+                                // check if backup name ends with .tar
+                                if(backup_name.ends_with(".tar")) {
+                                    backup_name = backup_name.substr(0, backup_name.size() - 4);
                                 } else {
-                                    return json_error(400, "Invalid backup file extension");
+                                    return json_error(400, "Invalid backup file extension. Expected .tar file");
                                 }
                             }
                             file_content = part.body;
@@ -562,7 +570,7 @@ int main(int argc, char** argv) {
 
                     // Check if backup already exists
                     std::string backup_path =
-                            settings::DATA_DIR + "/backups/" + backup_name + ".tar.gz";
+                            settings::DATA_DIR + "/backups/" + backup_name + ".tar";
                     if(std::filesystem::exists(backup_path)) {
                         return json_error(409,
                                           "Backup with name '" + backup_name + "' already exists");
@@ -583,6 +591,55 @@ int main(int argc, char** argv) {
                     }
 
                     return crow::response(201, "Backup uploaded successfully");
+                } catch(const std::exception& e) {
+                    return json_error(500, e.what());
+                }
+            });
+
+    // List all backup jobs
+    CROW_ROUTE(app, "/api/v1/backups/jobs")
+            .CROW_MIDDLEWARES(app, AuthMiddleware)
+            .methods("GET"_method)([&index_manager, &app](const crow::request& req) {
+                try {
+                    auto jobs = index_manager.getAllBackupJobs();
+
+                    std::vector<crow::json::wvalue> jobs_list;
+
+                    for(const auto& job : jobs) {
+                        crow::json::wvalue job_obj;
+                        job_obj["job_id"] = job.job_id;
+                        job_obj["index_id"] = job.index_id;
+                        job_obj["backup_name"] = job.backup_name;
+
+                        // Convert status enum to string
+                        if(job.status == BackupJobStatus::IN_PROGRESS) {
+                            job_obj["status"] = "in_progress";
+                        } else if(job.status == BackupJobStatus::COMPLETED) {
+                            job_obj["status"] = "completed";
+                        } else if(job.status == BackupJobStatus::FAILED) {
+                            job_obj["status"] = "failed";
+                        }
+
+                        if(!job.error_message.empty()) {
+                            job_obj["error"] = job.error_message;
+                        }
+
+                        auto started_time_t = std::chrono::system_clock::to_time_t(job.started_at);
+                        job_obj["started_at"] = started_time_t;
+
+                        if(job.status != BackupJobStatus::IN_PROGRESS) {
+                            auto completed_time_t =
+                                    std::chrono::system_clock::to_time_t(job.completed_at);
+                            job_obj["completed_at"] = completed_time_t;
+                        }
+
+                        jobs_list.push_back(std::move(job_obj));
+                    }
+
+                    crow::json::wvalue response;
+                    response["jobs"] = std::move(jobs_list);
+
+                    return crow::response(200, response.dump());
                 } catch(const std::exception& e) {
                     return json_error(500, e.what());
                 }
@@ -630,10 +687,16 @@ int main(int argc, char** argv) {
                         // Format full index_id
                         std::string index_id = ctx.username + "/" + index_name;
 
-                        if(index_manager.deleteIndex(index_id)) {
-                            return crow::response(200, "Index deleted successfully");
-                        } else {
-                            return json_error(404, "Index not found");
+                        try {
+                            if(index_manager.deleteIndex(index_id)) {
+                                return crow::response(200, "Index deleted successfully");
+                            } else {
+                                return json_error(404, "Index not found");
+                            }
+                        } catch(const std::runtime_error& e) {
+                            return json_error(400, e.what());
+                        } catch(const std::exception& e) {
+                            return json_error_500(ctx.username, req.url, std::string("Failed to delete index: ") + e.what());
                         }
                     });
 
@@ -969,6 +1032,8 @@ int main(int argc, char** argv) {
                     size_t count = index_manager.updateFilters(index_id, updates);
                     return crow::response(200, std::to_string(count) + " filters updated");
 
+                } catch(const std::runtime_error& e) {
+                    return json_error(400, e.what());
                 } catch(const std::exception& e) {
                     return json_error_500(ctx.username,
                                           req.url,
