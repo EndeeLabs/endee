@@ -9,12 +9,12 @@ namespace ndd {
 
     class ArchiveUtils {
     public:
-        // Create tar.gz archive from a directory
-        static bool createTarGz(const std::filesystem::path& source_dir,
-                                const std::filesystem::path& archive_path,
-                                std::string& error_msg) {
+        // Create tar archive from a directory (no compression)
+        static bool createTar(const std::filesystem::path& source_dir,
+                              const std::filesystem::path& archive_path,
+                              std::string& error_msg) {
             struct archive* a = archive_write_new();
-            archive_write_add_filter_gzip(a);
+            // No compression - removed archive_write_add_filter_gzip(a)
             archive_write_set_format_pax_restricted(a);
 
             if(archive_write_open_filename(a, archive_path.string().c_str()) != ARCHIVE_OK) {
@@ -59,8 +59,8 @@ namespace ndd {
             return true;
         }
 
-        // Extract tar.gz archive to a directory
-        static bool extractTarGz(const std::filesystem::path& archive_path,
+        // Extract tar archive to a directory (supports any format via libarchive)
+        static bool extractTar(const std::filesystem::path& archive_path,
                                  const std::filesystem::path& dest_dir,
                                  std::string& error_msg) {
             struct archive* a = archive_read_new();
