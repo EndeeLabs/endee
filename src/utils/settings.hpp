@@ -75,9 +75,7 @@ namespace settings {
     constexpr int EARLY_EXIT_BUFFER_QUERY = 8;
 
     // Pre-filter threshold - use pre-filter when cardinality is below this value
-    constexpr size_t PREFILTER_CARDINALITY_THRESHOLD = 1000;
-    // Use pre-filter if post-filter results are poor (less than this ratio of k)
-    constexpr float PREFILTER_RESULT_RATIO_THRESHOLD = 0.25f;  // k/4
+    constexpr size_t PREFILTER_CARDINALITY_THRESHOLD = 2500;
 
     //DEFAULT VALUES
     constexpr size_t DEFAULT_NUM_PARALLEL_INSERTS = 4;

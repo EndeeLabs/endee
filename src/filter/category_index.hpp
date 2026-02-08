@@ -11,7 +11,7 @@
 namespace ndd {
     namespace filter {
 
-        class BitmapIndex {
+        class CategoryIndex {
         private:
             MDBX_env* env_;
             MDBX_dbi dbi_;
@@ -101,22 +101,48 @@ namespace ndd {
             }
 
         public:
-            BitmapIndex(MDBX_env* env) :
+            CategoryIndex(MDBX_env* env) :
                 env_(env) {
                 MDBX_txn* txn;
                 int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
                 if(rc != MDBX_SUCCESS) {
-                    throw std::runtime_error("Failed to begin txn for BitmapIndex init");
+                    throw std::runtime_error("Failed to begin txn for CategoryIndex init");
                 }
 
-                // Open default DB or named DB? The original code used nullptr (default DB)
-                rc = mdbx_dbi_open(txn, nullptr, MDBX_CREATE, &dbi_);
+                // Open named DB for category/boolean
+                rc = mdbx_dbi_open(txn, "category_idx", MDBX_CREATE, &dbi_);
                 if(rc != MDBX_SUCCESS) {
                     mdbx_txn_abort(txn);
-                    throw std::runtime_error("Failed to open BitmapIndex dbi");
+                    throw std::runtime_error("Failed to open category_idx dbi");
                 }
 
                 mdbx_txn_commit(txn);
+            }
+
+            // Faceting: List all unique values for a field
+            std::vector<std::string> scan_values(const std::string& field) const {
+                std::vector<std::string> values;
+                MDBX_txn* txn;
+                if (mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn) != MDBX_SUCCESS) return values;
+
+                MDBX_cursor* cursor;
+                mdbx_cursor_open(txn, dbi_, &cursor);
+
+                std::string prefix = field + ":";
+                MDBX_val key{const_cast<char*>(prefix.c_str()), prefix.size()};
+                MDBX_val data;
+
+                int rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+                while(rc == MDBX_SUCCESS) {
+                    std::string found_key((char*)key.iov_base, key.iov_len);
+                    if(found_key.rfind(prefix, 0) != 0) break;
+
+                    values.push_back(found_key.substr(prefix.size()));
+                    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+                }
+                mdbx_cursor_close(cursor);
+                mdbx_txn_abort(txn);
+                return values;
             }
 
             ndd::RoaringBitmap get_bitmap(const std::string& field,
