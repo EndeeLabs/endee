@@ -1201,28 +1201,29 @@ namespace hnswlib {
                         continue;
                     }
 
+                    // Check filter BEFORE computing distance
+                    // Treats filtered nodes as non-existent (traverses a subgraph)
+                    if constexpr(!std::is_same_v<FilterFunctor, void>) {
+                        if (filter != nullptr) {
+                            if (!(*filter)(getExternalLabel(candidate_id))) {
+                                continue;
+                            }
+                        }
+                    }
+
                     sim = curSimFunc(data_point, neighbor_data, curDistParam);
 
                     if(top_candidates.size() < ef || sim > lowerBound) {
                         candidate_set.emplace(sim, candidate_id);
 
                         if(!has_deletions || !isMarkedDeleted(candidate_id)) {
-                            bool allowed = true;
-                            if constexpr(!std::is_same_v<FilterFunctor, void>) {
-                                if (filter != nullptr) {
-                                    allowed = (*filter)(getExternalLabel(candidate_id));
-                                }
-                            }
-                            
-                            if (allowed) {
-                                top_candidates.emplace(sim, candidate_id);
-                                if(top_candidates.size() > ef) {
-                                    top_candidates.pop();
-                                }
-                                if(!top_candidates.empty()) {
-                                    lowerBound = top_candidates.top().first;
-                                }
-                            }
+                             top_candidates.emplace(sim, candidate_id);
+                             if(top_candidates.size() > ef) {
+                                 top_candidates.pop();
+                             }
+                             if(!top_candidates.empty()) {
+                                 lowerBound = top_candidates.top().first;
+                             }
                         }
                     }
                 }
