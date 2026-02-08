@@ -2,18 +2,6 @@
 #include <curl/curl.h>
 #include <regex>
 
-#include "hnsw/hnswlib.h"
-#include "settings.hpp"
-#include "id_mapper.hpp"
-#include "vector_storage.hpp"
-#include "../sparse/sparse_storage.hpp"
-#include "rand_utils.hpp"
-#include "index_meta.hpp"
-#include "msgpack_ndd.hpp"
-#include "quant_vector.hpp"
-#include "wal.hpp"
-#include "../quant/dispatch.hpp"
-#include "../utils/archive_utils.hpp"
 #include <memory>
 #include <deque>
 #include <unordered_map>
@@ -28,6 +16,20 @@
 #include <random>
 #include <type_traits>
 #include <future>
+
+#include "hnsw/hnswlib.h"
+#include "settings.hpp"
+#include "id_mapper.hpp"
+#include "vector_storage.hpp"
+#include "../sparse/sparse_storage.hpp"
+#include "rand_utils.hpp"
+#include "index_meta.hpp"
+#include "msgpack_ndd.hpp"
+#include "quant_vector.hpp"
+#include "wal.hpp"
+#include "../quant/dispatch.hpp"
+#include "../utils/archive_utils.hpp"
+#include "storage/aws_s3.hpp"
 
 #define MAX_BACKUP_NAME_LENGTH 200
 
@@ -792,6 +794,26 @@ public:
             return {false, "Backup not found"};
         }
     }
+
+
+    std::pair<bool, std::string> archive_index(const std::string& index_id, const std::string& backup_name){
+
+        std::pair<bool, std::string> result = createBackup(index_id, backup_name);
+        if(!result.first){
+            return result;
+        }
+
+        std::string backup_dir_root = data_dir_ + "/backups";
+        std::string backup_dir = backup_dir_root + "/" + backup_name;
+        std::string backup_tar = backup_dir_root + "/" + backup_name + ".tar.gz";
+
+        if(!upload_to_s3(backup_tar)){
+            return {false, "unable to upload it to S3"};
+        }
+
+        return {true, ""};
+    }
+
 
     bool createIndex(const std::string& index_id,
                      const IndexConfig& config,

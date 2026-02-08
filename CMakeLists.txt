@@ -205,6 +205,12 @@ else()
     set(LIBARCHIVE_INCLUDE_DIR "${LIBARCHIVE_PATH}")
 endif()
 
+
+# =======================
+# Find AWS SDK
+# =======================
+find_package(AWSSDK REQUIRED COMPONENTS s3)
+
 # =======================
 # Find Other Dependencies
 # =======================
@@ -239,7 +245,12 @@ message(STATUS "Binary name: ${NDD_BINARY_NAME}")
 
 
 # Create the target
-add_executable(${NDD_BINARY_NAME} src/main.cpp ${LMDB_SOURCES} third_party/roaring_bitmap/roaring.c)
+add_executable(${NDD_BINARY_NAME}
+    src/main.cpp
+    src/storage/aws_s3.cpp
+    ${LMDB_SOURCES}
+    third_party/roaring_bitmap/roaring.c
+)
 
 # Set MDBX-specific compile flags
 set_source_files_properties(${LMDB_SOURCES} PROPERTIES
@@ -306,6 +317,7 @@ target_link_libraries(${NDD_BINARY_NAME} PRIVATE
     OpenSSL::Crypto
     CURL::libcurl
     archive_static
+    ${AWSSDK_LINK_LIBRARIES}
 )
 
 # Installation rules
