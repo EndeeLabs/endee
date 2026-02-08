@@ -243,7 +243,7 @@ namespace hnswlib {
 
             dist_t s;
             // Upper layer traversal - greedy search
-            for(levelInt level = maxLevel_; level > 0; level--) {
+            for(levelInt level = maxLevel_; level > 1; level--) {
                 bool changed = true;
                 while(changed) {
                     changed = false;
@@ -279,14 +279,31 @@ namespace hnswlib {
                 }
             }
 
+            std::vector<idhInt> entry_points;
+            if (maxLevel_ > 0) {
+                 std::vector<idhInt> l1_eps = {currObj};
+                 std::vector<std::pair<dist_t, idhInt>> l1_res;
+                 if(deletedElementsCount_) {
+                     l1_res = searchBaseLayer<false, true, FilterFunctor>(l1_eps, query_data, 1, M_, isIdAllowed);
+                 } else {
+                     l1_res = searchBaseLayer<false, false, FilterFunctor>(l1_eps, query_data, 1, M_, isIdAllowed);
+                 }
+                 
+                 for(size_t i = 0; i < std::min((size_t)2, l1_res.size()); ++i) {
+                     entry_points.push_back(l1_res[i].second);
+                 }
+            } else {
+                entry_points.push_back(entryPoint_);
+            }
+
             std::vector<std::pair<dist_t, idhInt>> top_candidates;
-            LOG_DEBUG("Starting search in level 0..current object " << currObj);
+            LOG_DEBUG("Starting search in level 0..");
             if(deletedElementsCount_) {
                 top_candidates = searchBaseLayer<false, true, FilterFunctor>(
-                        currObj, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
+                        entry_points, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
             } else {
                 top_candidates = searchBaseLayer<false, false, FilterFunctor>(
-                        currObj, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
+                        entry_points, query_data, 0, std::max(ef, k), isIdAllowed);  // Level 0 for final search
             }
             LOG_DEBUG("Search in level 0 completed. Found " << top_candidates.size()
                                                             << " candidates");
@@ -658,12 +675,13 @@ namespace hnswlib {
                     
                     const void* level_datapoint = (level == 0) ? datapoint : datapoint_upper.data();
                     
+                    std::vector<idhInt> cur_eps = {currObj};
                     if(deletedElementsCount_) {
                         sorted_candidates = searchBaseLayer<true, true>(
-                                currObj, level_datapoint, level, efConstruction_);
+                                cur_eps, level_datapoint, level, efConstruction_);
                     } else {  // No deleted elements
                         sorted_candidates = searchBaseLayer<true, false>(
-                                currObj, level_datapoint, level, efConstruction_);
+                                cur_eps, level_datapoint, level, efConstruction_);
                     }
                     currObj = mutuallyConnectNewElement(
                             level_datapoint, cur_c, sorted_candidates, level);
@@ -1076,7 +1094,7 @@ namespace hnswlib {
         // Returns a vector of top candidates sorted by similarity (1-distance) in reverse order
         template <bool is_insert, bool has_deletions, typename FilterFunctor = void>
         std::vector<std::pair<dist_t, idhInt>>
-        searchBaseLayer(idhInt ep_id, const void* data_point, idhInt layer, size_t ef, FilterFunctor* filter = nullptr) const {
+        searchBaseLayer(const std::vector<idhInt>& ep_ids, const void* data_point, idhInt layer, size_t ef, FilterFunctor* filter = nullptr) const {
             LOG_TIME("searchBaseLayer");
             VisitedList* vl = visited_list_pool_->getFreeVisitedList();
             vl_type* visited_array = vl->mass;
@@ -1094,60 +1112,65 @@ namespace hnswlib {
                 buffer.resize(curDataSize);
             }
 
-            dist_t lowerBound;
-            if(!has_deletions || !isMarkedDeleted(ep_id)) {
+            dist_t lowerBound = std::numeric_limits<dist_t>::lowest();
 
-                const void* vec_data = nullptr;
-                if(layer == 0) {
-                    if(getDataByInternalId(ep_id, layer, buffer.data())) {
-                        vec_data = buffer.data();
-                    }
-                } else {
-                    vec_data = getUpperLayerDataPtr(ep_id);
+            for (idhInt ep_id : ep_ids) {
+                if (visited_array[ep_id] == visited_array_tag) {
+                    continue;
                 }
+                visited_array[ep_id] = visited_array_tag;
 
-                if(vec_data) {
-                    dist_t sim = curSimFunc(data_point, vec_data, curDistParam);
-
-                    if constexpr(std::is_same_v<FilterFunctor, void>) {
-                        top_candidates.emplace(sim, ep_id);
-                        candidate_set.emplace(sim, ep_id);
-                        lowerBound = sim;
-                    } else if constexpr(std::is_same_v<FilterFunctor, BaseFilterFunctor>) {
-                         // Virtual call path
-                         bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
-                         candidate_set.emplace(sim, ep_id); // Always explore
-                         if (allowed) {
-                             top_candidates.emplace(sim, ep_id);
-                             lowerBound = sim;
-                         } else {
-                              lowerBound = std::numeric_limits<dist_t>::lowest(); 
-                              // If not allowed, we don't add to top_candidates, 
-                              // so lowerBound remains low unless we find allowed.
-                              // Actually if top_candidates is empty, lowerBound logic needs care.
-                         }
-                    } else {
-                        // Templated path
-                        bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
-                        candidate_set.emplace(sim, ep_id);
-                        if (allowed) {
-                            top_candidates.emplace(sim, ep_id);
-                            lowerBound = sim;
-                        } else {
-                             lowerBound = std::numeric_limits<dist_t>::lowest();
+                dist_t sim = std::numeric_limits<dist_t>::lowest();
+                if(!has_deletions || !isMarkedDeleted(ep_id)) {
+                    const void* vec_data = nullptr;
+                    if(layer == 0) {
+                        if(getDataByInternalId(ep_id, layer, buffer.data())) {
+                            vec_data = buffer.data();
                         }
+                    } else {
+                        vec_data = getUpperLayerDataPtr(ep_id);
+                    }
+
+                    if(vec_data) {
+                        sim = curSimFunc(data_point, vec_data, curDistParam);
+
+                        if constexpr(std::is_same_v<FilterFunctor, void>) {
+                            top_candidates.emplace(sim, ep_id);
+                            candidate_set.emplace(sim, ep_id);
+                        } else if constexpr(std::is_same_v<FilterFunctor, BaseFilterFunctor>) {
+                            // Virtual call path
+                            bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
+                            candidate_set.emplace(sim, ep_id); // Always explore
+                            if (allowed) {
+                                top_candidates.emplace(sim, ep_id);
+                            }
+                        } else {
+                            // Templated path
+                            bool allowed = !filter || (*filter)(getExternalLabel(ep_id));
+                            candidate_set.emplace(sim, ep_id);
+                            if (allowed) {
+                                top_candidates.emplace(sim, ep_id);
+                            }
+                        }
+                        
+                        // Maintain ef size in top_candidates during init
+                        if(top_candidates.size() > ef) {
+                             top_candidates.pop();
+                        }
+                    } else {
+                        // Data fetch failed
+                         candidate_set.emplace(std::numeric_limits<dist_t>::lowest(), ep_id);
                     }
                 } else {
-                    lowerBound = std::numeric_limits<dist_t>::lowest();
-                    candidate_set.emplace(lowerBound, ep_id);
+                    // Deleted
+                    candidate_set.emplace(std::numeric_limits<dist_t>::lowest(), ep_id);
                 }
-            } else {
-                // If entry point is deleted, lower bound will be minimum
-                lowerBound = std::numeric_limits<dist_t>::lowest();
-                candidate_set.emplace(lowerBound, ep_id);
             }
 
-            visited_array[ep_id] = visited_array_tag;
+            if (!top_candidates.empty()) {
+                lowerBound = top_candidates.top().first;
+            }
+
             int below_threshold_count = 0;
             int max_below_threshold = is_insert ? settings::EARLY_EXIT_BUFFER_INSERT
                                                 : settings::EARLY_EXIT_BUFFER_QUERY;

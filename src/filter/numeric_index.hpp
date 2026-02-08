@@ -426,9 +426,27 @@ namespace ndd {
                          // "Slide Split": Scan right from median
                          size_t mid_idx = b.ids.size() / 2;
                          
-                         // Slide right if values are same (uniqueness constraint)
-                         while (mid_idx < b.deltas.size() && b.deltas[mid_idx] == b.deltas[0]) {
-                             mid_idx++;
+                         // Ensure we don't split a group of identical values
+                         size_t probe_right = mid_idx;
+                         while (probe_right < b.deltas.size() && probe_right > 0 && b.deltas[probe_right] == b.deltas[probe_right - 1]) {
+                             probe_right++;
+                         }
+
+                         if (probe_right < b.deltas.size()) {
+                             mid_idx = probe_right;
+                         } else {
+                             // Fallback: Try scanning left
+                             size_t probe_left = mid_idx;
+                             while (probe_left > 0 && b.deltas[probe_left] == b.deltas[probe_left - 1]) {
+                                 probe_left--;
+                             }
+                             
+                             if (probe_left > 0) {
+                                 mid_idx = probe_left;
+                             } else {
+                                 // All identical
+                                 mid_idx = b.deltas.size();
+                             }
                          }
                          
                          // If we hit end, we can't split by value uniqueness
