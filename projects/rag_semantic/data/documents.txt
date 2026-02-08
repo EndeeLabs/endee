@@ -1,0 +1,9 @@
+Artificial Intelligence enables machines to mimic human intelligence.
+
+Machine Learning is a subset of AI that learns from data.
+
+Vector databases store embeddings for semantic search.
+
+RAG combines retrieval and generation to produce accurate answers.
+
+Endee is a high-performance vector database designed for similarity search.
